@@ -52,6 +52,17 @@ from suspension import ggv as ggv_mod
 from suspension import tire_thermal as thermal_mod
 from suspension import units as units_mod
 
+# SysBridge risk engine integration (sysbridge_kinematik.py + sysbridge_engine.py)
+try:
+    from sysbridge_kinematik import (
+        build_risk_context, run_sysbridge, gate_colour,
+        KinematiKRiskContext,
+    )
+    _HAS_SYSBRIDGE = True
+except ImportError as _sb_err:
+    _HAS_SYSBRIDGE = False
+    _sb_import_err = str(_sb_err)
+
 # --------------------------------------------------------------------------- #
 #  Cached compute layer.
 #
@@ -908,12 +919,328 @@ especially the things that *didn't* work. It takes ten seconds with the template
 and it's the difference between next year starting ahead or relearning everything.
     """)
 
+# ============================================================================
+#  SysBridge Risk Tab — render function
+# ============================================================================
+@st.cache_data(show_spinner=False)
+def _cached_sysbridge(
+    camber_gain, bump_steer, roll_centre_h, scrub, caster, kpi,
+    converged_frac, topology, total_mass, max_lat_g, front_w_dist,
+    max_member_load, lap_time_s, avg_speed_ms,
+    oot_channels, total_channels,
+    service_age_yr, open_ncrs, jurisdiction,
+):
+    """Thin hashable wrapper so Streamlit caches the SysBridge compute."""
+    from sysbridge_kinematik import KinematiKRiskContext, run_sysbridge
+    ctx = KinematiKRiskContext(
+        camber_gain_deg_per_10mm=camber_gain,
+        bump_steer_deg_per_10mm=bump_steer,
+        roll_centre_height_mm=roll_centre_h,
+        scrub_radius_mm=scrub,
+        caster_deg=caster,
+        kpi_deg=kpi,
+        converged_fraction=converged_frac,
+        topology_name=topology,
+        total_mass_kg=total_mass,
+        max_lateral_g=max_lat_g,
+        front_weight_dist=front_w_dist,
+        max_member_load_fraction=max_member_load,
+        lap_time_s=lap_time_s,
+        avg_speed_ms=avg_speed_ms,
+        oot_channels=oot_channels,
+        total_channels=total_channels,
+        service_age_yr=service_age_yr,
+        open_ncrs=open_ncrs,
+        jurisdiction=jurisdiction,
+    )
+    return run_sysbridge(ctx)
+
+
+def _render_sysbridge_tab():
+    """Render the SysBridge risk panel inside the KinematiK UI."""
+    if not _HAS_SYSBRIDGE:
+        st.error(
+            f"SysBridge engine not found. Place `sysbridge_engine.py` and "
+            f"`sysbridge_kinematik.py` next to `app.py` and restart.\n\n"
+            f"Import error: {_sb_import_err if 'sb_import_err' in dir() else 'unknown'}"
+        )
+        return
+
+    st.markdown(
+        '''<p class="hint">
+        <b>SysBridge</b> is a standards-anchored risk engine (R1–R9) for engineering designs.
+        This tab maps your live KinematiK suspension state — geometry quality, convergence,
+        load path, lap sim, and correlation results — onto SysBridge inputs and computes a
+        calibrated risk score, failure diagnoses, interaction warnings, and ranked
+        remediations. The score updates every time the geometry or vehicle params change.
+        </p>''', unsafe_allow_html=True
+    )
+
+    # ── User-adjustable context inputs ───────────────────────────────────────
+    with st.expander("Risk context (optional — refines the score)", expanded=False):
+        sb_c1, sb_c2, sb_c3 = st.columns(3)
+        sb_service_age = sb_c1.number_input(
+            "Car service age (seasons)", 0.0, 10.0, value=0.0, step=0.5,
+            help="How many FSAE seasons has this car already run? 0 = brand new."
+        )
+        sb_open_ncrs = sb_c2.number_input(
+            "Open NCRs / design issues", 0, 50, value=0, step=1,
+            help="Count of open non-conformances or unresolved design review findings."
+        )
+        sb_jurisdiction = sb_c3.selectbox(
+            "Jurisdiction", ["US", "EU", "UK", "AU", "CA", "JP"],
+            index=0,
+            help="Regulatory jurisdiction — affects the discipline-risk calibration."
+        )
+
+    # ── Pull live KinematiK state into a context snapshot ────────────────────
+    # These values are already computed by the solver above; we just read them.
+    try:
+        _s = kin.static
+        _roll_c = float(getattr(_s, "roll_centre_height", 0.0) or 0.0)
+        _scrub  = float(getattr(_s, "scrub_radius", 0.0) or 0.0)
+        _caster = float(getattr(_s, "caster", 0.0) or 0.0)
+        _kpi    = float(getattr(_s, "kpi", 0.0) or 0.0)
+    except Exception:
+        _roll_c = _scrub = _caster = _kpi = 0.0
+
+    _cambers = [st_.camber for st_ in sweep if st_.converged and __import__("math").isfinite(st_.camber)]
+    _toes    = [st_.toe    for st_ in sweep if st_.converged and __import__("math").isfinite(st_.toe)]
+    _travels = [st_.travel for st_ in sweep if st_.converged]
+    import math as _math
+    if len(_cambers) >= 2 and len(_travels) >= 2:
+        _span = _travels[-1] - _travels[0]
+        _cg = abs((_cambers[-1] - _cambers[0]) / _span) * 10.0 if _span else 0.0
+        _bs = abs((_toes[-1] - _toes[0]) / _span) * 10.0 if _span else 0.0
+    else:
+        _cg = _bs = 0.0
+    _conv_frac = sum(1 for st_ in sweep if st_.converged) / max(1, len(sweep))
+
+    try:
+        _max_lat = float(veh.max_lateral_g())
+        if not _math.isfinite(_max_lat) or _max_lat <= 0:
+            _max_lat = 1.4
+    except Exception:
+        _max_lat = 1.4
+
+    _topo_name = "double_wishbone"
+    try:
+        if hasattr(kin, "mechanism") and hasattr(kin.mechanism, "topology_name"):
+            _topo_name = kin.mechanism.topology_name
+    except Exception:
+        pass
+
+    # member load fraction (best-effort)
+    _max_mf = 0.0
+    try:
+        from suspension import loadpath as _lp
+        _p = veh.p
+        _wl = _lp.WheelLoad(
+            Fx=0.0,
+            Fy=_p.mass * 9.81 * 1.5 * _p.weight_dist_front,
+            Fz=_p.mass * 9.81 * _p.weight_dist_front,
+        )
+        _mf = _lp.solve_member_forces(kin, kin.static, _wl)
+        _forces = [abs(v) for v in _mf.forces.values() if _math.isfinite(v)]
+        if _forces:
+            _max_mf = min(1.0, max(_forces) / 5000.0)
+    except Exception:
+        _max_mf = 0.0
+
+    # Run the engine (cached)
+    sb_result = _cached_sysbridge(
+        camber_gain=round(_cg, 4),
+        bump_steer=round(_bs, 4),
+        roll_centre_h=round(_roll_c, 2),
+        scrub=round(_scrub, 2),
+        caster=round(_caster, 3),
+        kpi=round(_kpi, 3),
+        converged_frac=round(_conv_frac, 4),
+        topology=_topo_name,
+        total_mass=round(veh.p.mass, 1),
+        max_lat_g=round(_max_lat, 3),
+        front_w_dist=round(veh.p.weight_dist_front, 3),
+        max_member_load=round(_max_mf, 4),
+        lap_time_s=float("nan"),
+        avg_speed_ms=float("nan"),
+        oot_channels=0,
+        total_channels=0,
+        service_age_yr=float(sb_service_age),
+        open_ncrs=int(sb_open_ncrs),
+        jurisdiction=sb_jurisdiction,
+    )
+
+    score   = sb_result.score
+    verdict = sb_result.verdict
+    gate    = verdict.gate.value
+
+    # ── Score headline ────────────────────────────────────────────────────────
+    gate_cls = gate_colour(gate)
+    gate_icon = {"PASS": "✓", "CONDITIONAL": "⚠", "REJECT": "✗", "HOLD": "⏸"}.get(gate, "")
+
+    st.markdown(
+        f'''<div style="display:flex;gap:1.2rem;align-items:stretch;margin-bottom:1rem;">
+          <div class="metric" style="min-width:130px;">
+            <span class="k">Calibrated risk score</span>
+            <span class="v {'bad' if score.score >= 70 else ('warn' if score.score >= 40 else 'good')}">{score.score}<span class="u"> / 100</span></span>
+          </div>
+          <div class="metric" style="min-width:130px;">
+            <span class="k">Design gate</span>
+            <span class="v {gate_cls}">{gate_icon} {gate}</span>
+          </div>
+          <div class="metric" style="min-width:130px;">
+            <span class="k">Failures found</span>
+            <span class="v {'bad' if sb_result.failures else 'good'}">{len(sb_result.failures)}</span>
+          </div>
+          <div class="metric" style="min-width:130px;">
+            <span class="k">Interactions</span>
+            <span class="v {'bad' if sb_result.interactions else 'good'}">{len(sb_result.interactions)}</span>
+          </div>
+        </div>
+        <p class="hint" style="margin-bottom:.8rem;">{verdict.gate_rationale}</p>''',
+        unsafe_allow_html=True
+    )
+
+    # ── Component breakdown ───────────────────────────────────────────────────
+    with st.expander("R1–R9 score breakdown", expanded=True):
+        _comp_cols = st.columns(3)
+        for i, comp in enumerate(score.derivation.components):
+            pct = comp.fraction * 100
+            cls = "bad" if pct >= 70 else ("warn" if pct >= 40 else "good")
+            _comp_cols[i % 3].markdown(
+                f'''<div class="metric" style="margin-bottom:.5rem;">
+                  <span class="k">{comp.code} · {comp.label}</span>
+                  <span class="v {cls}">{comp.score:.1f}<span class="u"> / {comp.max_score:.0f}</span></span>
+                  <span class="hint" style="font-size:.72rem;">{comp.explanation[:120]}{"…" if len(comp.explanation) > 120 else ""}</span>
+                </div>''',
+                unsafe_allow_html=True
+            )
+
+    # ── Failure diagnoses ─────────────────────────────────────────────────────
+    if sb_result.failures:
+        st.markdown("#### Failure diagnoses")
+        for fd in sb_result.failures:
+            sev_cls = {"CRITICAL": "bad", "HIGH": "bad", "MODERATE": "warn", "LOW": ""}.get(fd.severity.value, "")
+            st.markdown(
+                f'''<div class="card" style="margin-bottom:.6rem;">
+                  <span class="tag {sev_cls}">{fd.severity.value}</span>
+                  <span class="tag" style="margin-left:.4rem;">{fd.component}</span>
+                  <b style="margin-left:.6rem;">{fd.mode}</b>
+                  <p style="margin:.4rem 0 .2rem;font-size:.88rem;">{fd.threshold_description}</p>
+                  <span class="hint" style="font-size:.75rem;">Standard: {fd.standard_cite}</span>
+                </div>''',
+                unsafe_allow_html=True
+            )
+    else:
+        st.markdown(
+            '<p class="hint">✓ No failure modes diagnosed at current geometry and vehicle state.</p>',
+            unsafe_allow_html=True
+        )
+
+    # ── Interaction warnings ──────────────────────────────────────────────────
+    if sb_result.interactions:
+        st.markdown("#### Dangerous interactions")
+        for iw in sb_result.interactions:
+            st.markdown(
+                f'''<div class="card" style="margin-bottom:.6rem;border-color:#5a4317;">
+                  <span class="tag warn">×{iw.amplification_factor:.2f} amplification</span>
+                  <b style="margin-left:.6rem;">{iw.name}</b>
+                  <p style="margin:.4rem 0 .2rem;font-size:.88rem;">{iw.consequence}</p>
+                  <span class="hint" style="font-size:.75rem;">
+                    {iw.component_a} ({iw.condition_a}) ↔ {iw.component_b} ({iw.condition_b})
+                  </span>
+                </div>''',
+                unsafe_allow_html=True
+            )
+
+    # ── Ranked remediations ───────────────────────────────────────────────────
+    if sb_result.remediations:
+        st.markdown("#### Ranked remediations")
+        for rem in sorted(sb_result.remediations, key=lambda r: -r.score_impact):
+            impact_cls = "bad" if rem.score_impact >= 10 else ("warn" if rem.score_impact >= 5 else "")
+            st.markdown(
+                f'''<div class="card" style="margin-bottom:.6rem;">
+                  <span class="tag {impact_cls}">−{rem.score_impact:.1f} pts</span>
+                  <span class="tag" style="margin-left:.4rem;">{rem.component}</span>
+                  <p style="margin:.4rem 0 .2rem;font-size:.88rem;">{rem.action}</p>
+                  <span class="hint" style="font-size:.75rem;">Standard: {rem.standard_cite}</span>
+                </div>''',
+                unsafe_allow_html=True
+            )
+    else:
+        st.markdown(
+            '<p class="hint">No remediations triggered — score is in a low-risk band.</p>',
+            unsafe_allow_html=True
+        )
+
+    # ── What the inputs map to ────────────────────────────────────────────────
+    with st.expander("How KinematiK maps to SysBridge inputs", expanded=False):
+        st.markdown(
+            f"""
+**R1 — Event severity proxy**
+Simulation channels out-of-tolerance (from Validation tab) map to design escapes.
+Currently: `{sb_result.context.oot_channels}` OOT / `{sb_result.context.total_channels}` total.
+
+**R2 — FMEA proxy RPN**
+Camber gain `{_cg:.3f} °/10mm` and bump steer `{_bs:.3f} °/10mm` drive Occurrence;
+solver convergence gap drives Severity; detection quality drives Detection.
+Proxy RPN = `{sb_result.inputs.fmea_max_rpn:.0f}` (SAE J1739 action threshold: 100).
+
+**R3 — Detection gap**
+`{(1 - _conv_frac)*100:.1f}%` of the suspension travel sweep did not converge.
+These are positions the model cannot inspect → detection gap = `{sb_result.inputs.detection_gap:.2f}`.
+
+**R4 — Remaining life**
+Design life: `{sb_result.inputs.t_min_yr:.1f}` yr (FSAE standard).
+Service age: `{sb_result.inputs.service_age_yr:.1f}` yr.
+
+**R5 — Stability / amplification**
+Camber gain of `{_cg:.3f} °/10mm` → g-amplification = `{sb_result.inputs.g_amplification:.2f}`.
+Values > 1.0 indicate sensitivity amplification in the design.
+
+**R6 — Completeness**
+`{sb_result.inputs.variable_count}` of 30 effective geometry variables populated
+(`{sb_result.inputs.variable_spread*100:.0f}%` sweep coverage).
+
+**R7 — Regulatory**
+Discipline: `{sb_result.inputs.discipline}` · Jurisdiction: `{sb_result.inputs.jurisdiction}`.
+
+**R8 — QMS**
+Open NCRs: `{sb_result.inputs.qms_open_ncrs}` (user-entered + OOT channels).
+
+**R9 — Physics model**
+Model: `{sb_result.inputs.physics_model_name}`.
+Member load index: `{sb_result.inputs.physics_damage_index:.3f}` (normalised to 5 kN).
+            """,
+            unsafe_allow_html=False
+        )
+
+    # ── Release blockers ──────────────────────────────────────────────────────
+    if verdict.release_blockers:
+        st.markdown("#### Release blockers")
+        for b in verdict.release_blockers:
+            st.markdown(
+                f'<div class="card" style="margin-bottom:.4rem;border-color:#5a2422;">'                f'<span class="hint" style="font-size:.82rem;">{b}</span></div>',
+                unsafe_allow_html=True
+            )
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    st.markdown(
+        f'''<p class="hint" style="margin-top:1rem;font-size:.76rem;">
+        SysBridge engine v{score.engine_version} · schema {score.schema} ·
+        inputs fingerprint <code>{score.inputs_fingerprint[:16]}…</code>
+        </p>''',
+        unsafe_allow_html=True
+    )
+
+
 _tabs = st.tabs(
     ["  KINEMATICS  ", "  ROLL & LOAD TRANSFER  ", "  GRIP BALANCE  ",
      "  3D MODEL  ", "  COMPLIANCE (FLEX)  ", "  TEAM FIT  ",
      "  WEIGHT & HANDOVER  ", "  LEAD NOTES  ",
      "  TIRE & GRIP  ", "  SETUP OPTIMISER  ", "  LAP TIME  ", "  GGV DIAGRAM  ", "  TRANSIENT  ",
-     "  VALIDATION  ", "  INTEGRATION  ", "  ELECTRONICS (PCB)  "])
+     "  VALIDATION  ", "  INTEGRATION  ", "  ELECTRONICS (PCB)  ",
+     "  ⬡ SYSBRIDGE RISK  "])
 # GEOMETRY 3D and FULL CAR 3D are now one merged "3D MODEL" tab (tab4): a single
 # view with a toggle between the live linkage geometry and the assembled full
 # car, where clicking any part of the full car auto-zooms the camera onto it.
@@ -928,7 +1255,7 @@ _tabs = st.tabs(
 # HV-aggressor coupling), rendered by render_pcb_board().
 # tab_car now aliases tab4 — the full-car view lives inside the same merged tab.
 (tab1, tab2, tab3, tab4, tab5c, tab6, tab7, tab8, tab9, tab10, tab11, tab_ggv,
- tab_tr, tab12, tab13, tab_pcb) = _tabs
+ tab_tr, tab12, tab13, tab_pcb, tab_sysbridge) = _tabs
 tab_car = tab4
 
 # Global live notifier: polls the shared store and toasts every session when any
@@ -5478,6 +5805,10 @@ with sc3:
 with tab_pcb:
     render_pcb_board()
     render_harness()
+
+# ----------------------------- TAB: SYSBRIDGE RISK ------------------------- #
+with tab_sysbridge:
+    _render_sysbridge_tab()
 
 st.markdown('<p class="hint" style="padding-top:.4rem;">Open source · MIT. Fork it, '
             'validate against your OptimumK model, send a PR. '
