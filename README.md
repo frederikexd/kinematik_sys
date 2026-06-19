@@ -25,7 +25,7 @@ Born as a Formula SAE double-wishbone tool, now a general multibody kinematics p
 
 ## 30-second tour (every tab)
 
-Sixteen tabs, front to back. Each takes the live geometry + setup and answers one question; nothing is retyped between them — mass/CG, peak currents, ride heights and the tire all flow from one source of truth.
+Seventeen tabs, front to back. Each takes the live geometry + setup and answers one question; nothing is retyped between them — mass/CG, peak currents, ride heights and the tire all flow from one source of truth.
 
 1. **KINEMATICS** — the 3D constraint solver. Edit hardpoints live for **any** topology — not just the double wishbone's ten points, but every pickup, free joint and carrier point of a strut, multi-link, trailing arm, solid axle, twist-beam, truck steer linkage, or free-form `from_links` corner — and read camber gain, bump steer (toe vs travel), caster, KPI, scrub radius, the front-view instant centre, the **real motion ratio** off the pushrod/rocker (→ wheel rate, rising/falling-rate curve), and **anti-dive / anti-squat** from the side-view swing arm. Pick the topology in the sidebar; each one keeps its own edited geometry and re-solves through the same agnostic engine.
 2. **ROLL & LOAD TRANSFER** — roll-centre height and *migration* through travel/roll, and the front/rear lateral load-transfer split that migration drives — the geometry→balance link the spreadsheets skip.
@@ -43,6 +43,84 @@ Sixteen tabs, front to back. Each takes the live geometry + setup and answers on
 14. **VALIDATION** — earn trust by matching data. Skidpad g / circle time, 75 m accel, and a GPS **speed-trace** RMSE/bias/R²; the **Virtual Tunnel Solver** (sweep the physical aero map → **write the solver case files** → run the matched k-omega SST points through **Star-CCM+, TS-Auto *and* OpenFOAM at once** → fuse them into one cross-code **consensus**, with the **inter-code spread** as the confidence signal → point-by-point C_l/C_d/balance calibration); **surface pressure taps** (raw volts → C_p on the wing → stall detection → RMSE vs CFD); and the **live acquisition front end** — a Virtual Instrument off the force balance + Scanivalve/Chell scanners that decouples the 6×6 balance and filters the fan tone (offline *or* real-time) into clean F_x/F_y/F_z and raw P_static. Any correlation or CFD calibration can be logged straight to handover. No number is tuned to fit, no single code is just trusted, and a solver that can't run is an honest hole, never a fabricated number; the gap is quantified and logged to handover.
 15. **INTEGRATION** — the live cross-subsystem surface, in several views: a **cross-subsystem ledger** (the one place mass, CG and peak currents are declared, against shared car-level budgets/limits), **subsystem ↔ chassis CAD fit**, and **mount-point clash** — move a mount and the clash verdict plus mass/CG propagate in one call. It also **feeds the as-built numbers back into the physics**, keeps a **pending-change log**, and exports a Markdown **interface report**. Persists with the project.
 16. **ELECTRONICS (PCB)** — copper-survival (IPC-2221 heating, Onderdonk fusing, IR-drop / ECU brown-out) + signal integrity (diff-pair impedance, HV-aggressor coupling), reading the **same** declared peak currents as the integration ledger so "what fires at once" is never retyped.
+17. **⬡ SYSBRIDGE RISK** — maps your live suspension state into the SysBridge R1–R9 risk engine and returns a calibrated risk score (0–100), a PASS / CONDITIONAL / REJECT / HOLD gate verdict, named failure diagnoses, dangerous interaction warnings, and ranked remediations — all derived from the geometry, solver convergence quality, and correlation results already on screen. Nothing is retyped: the score updates automatically whenever a hardpoint or vehicle parameter changes. Run the Validation tab first to make the R1/R2/R8 scores data-driven rather than at their neutral defaults.
+
+---
+
+## SysBridge risk integration
+
+KinematiK embeds the **SysBridge** risk engine — a standards-anchored R1–R9 scoring pipeline originally built for engineering design review. The **⬡ SYSBRIDGE RISK** tab runs it live against your current suspension state.
+
+### What it scores
+
+SysBridge organises risk across nine components. KinematiK maps its physics outputs onto them:
+
+| Code | Label | KinematiK source |
+|------|-------|-----------------|
+| R1 | Recall / event severity | Out-of-tolerance correlation channels (Validation tab). Each OOT channel is a design prediction that diverged from measurement — a proxy for a reportable design escape. |
+| R2 | FMEA criticality (proxy RPN) | Camber gain and bump steer drive Occurrence (high sensitivity → higher RPN); solver convergence fraction drives Severity (unconverged states are uninspectable); correlation quality drives Detection. Proxy RPN = O × S × D, compared against the SAE J1739 action threshold of 100. |
+| R3 | Detection gap | Fraction of the travel sweep that did not converge. Positions the solver cannot solve are positions the model cannot inspect — a direct detection gap. |
+| R4 | Remaining life | User-entered service age (seasons) against the 3-season FSAE design life. New car = 0 yr; a car halfway through its second season = 1.5 yr. |
+| R5 | Stability / amplification | Camber gain magnitude as a sensitivity amplifier. High camber gain means small hardpoint tolerances or compliance-steer displacements drive large camber changes at the contact patch. g-amplification scales from 1.0 at the nominal rate (1.0 °/10 mm) up to ~2.5 at the critical rate (3.5 °/10 mm). |
+| R6 | Completeness | Sweep convergence fraction as effective geometry variable coverage. A fully converged 41-point sweep scores 30/30 effective variables. |
+| R7 | Discipline / jurisdiction | Fixed to "motorsport suspension dynamics" (DisciplineTier.OPERATIONAL). Jurisdiction is user-selectable (US default). |
+| R8 | QMS open issues | User-entered open NCRs plus OOT correlation channels. |
+| R9 | Physics model coverage | KinematiK model name plus the normalised maximum member load fraction at 1.5 g cornering (max axial force / 5 kN). |
+
+### Gate verdicts
+
+| Score | Gate | Meaning |
+|-------|------|---------|
+| 0–39 | PASS | No critical failures; continue normal design cycle. |
+| 40–69 | CONDITIONAL | No critical failures; HIGH-severity findings must be resolved before full release. |
+| ≥ 70 | REJECT | Critical failure present or score too high. |
+| ≥ 70 + active interactions | HOLD | Same as REJECT, compounded by amplification between components. |
+
+### Getting the most out of it
+
+- **Run Validation first.** With no correlation data, R1/R2/R8 default to neutral (zero). Load a skidpad or speed-trace run and any out-of-tolerance channel immediately tightens the score.
+- **R5 is the most directly suspension-relevant component.** Camber gain above 3.5 °/10 mm moves the amplification factor above 2 and starts pulling the score upward even with everything else neutral. Reducing it (wider wishbone spread, repositioned instant centre) is the single highest-leverage geometry change for the risk score.
+- **R3 rewards a clean solver.** If more than ~10% of your travel sweep does not converge, fix the hardpoints — the score will not settle until the geometry is physically realisable across its full travel range.
+- **Service age is zero for a new car.** Enter it honestly once the car starts accumulating seasons; R4 will flag the remaining-life margin as the car approaches its design life.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `sysbridge_engine.py` | The SysBridge scoring engine — pure Python stdlib, no extra dependencies beyond what KinematiK already requires. |
+| `sysbridge_kinematik.py` | Bridge module: translates live KinematiK objects (`SuspensionKinematics`, `VehicleDynamics`, sweep, correlation report) into a `RiskInputs` bundle, runs the full pipeline, and returns a structured `SysBridgeResult`. |
+
+No new packages are required. Run as normal:
+
+```bash
+streamlit run app.py
+```
+
+The SysBridge tab appears as the last tab in the studio.
+
+### Using the bridge from code
+
+```python
+from sysbridge_kinematik import build_risk_context, run_sysbridge
+
+# kin, veh, sweep are the same objects every other KinematiK module uses
+ctx = build_risk_context(
+    kin, veh, sweep,
+    lap_result=None,       # optional — LapResult from laptime.simulate_lap()
+    corr_report=None,      # optional — CorrelationReport from correlation tab
+    service_age_yr=0.0,    # how many FSAE seasons this car has run
+    open_ncrs=0,           # open design-review non-conformances
+    jurisdiction="US",
+)
+result = run_sysbridge(ctx)
+
+print(f"Score: {result.score.score}/100  Gate: {result.verdict.gate.value}")
+for fd in result.failures:
+    print(f"  [{fd.severity.value}] {fd.component}: {fd.mode}")
+for rem in sorted(result.remediations, key=lambda r: -r.score_impact):
+    print(f"  Fix ({rem.component}, -{rem.score_impact:.1f} pts): {rem.action[:80]}")
+```
+
 
 ---
 
