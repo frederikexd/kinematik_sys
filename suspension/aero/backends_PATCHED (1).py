@@ -15,32 +15,16 @@ CFD backends for the aero co-sim boundary defined in `cfd.py`.
     it is a stand-in, not a Navier–Stokes solve. This is the aero analogue of
     `ReferenceTireModel`.
 
-  * `FluentVerificationSolver` — the DEFAULT path of the Virtual (Wind) Tunnel. It
-    is self-contained: KinematiK computes the aero coefficients INTERNALLY (it wraps
-    the same analytic attitude model as `ReferenceAeroModel`), so the user needs NO
-    ANSYS Fluent license, no mesh, and no external solver to get a usable answer. At
-    the same time, for every case it ALWAYS writes a complete, ready-to-run ANSYS
-    Fluent journal (.jou) so the user can independently VERIFY the internal number
-    on their own licensed Fluent install whenever they want. The journal is a
-    verification artefact, not a prerequisite. Provenance shouts that the headline
-    number is an in-house analytic estimate, not a Navier–Stokes solve, and that the
-    Fluent deck is provided for confirmation.
-
-  * `OpenFOAMSolver` — a REAL adapter, kept for teams who want to drive a true RANS
-    solve themselves. It writes a valid OpenFOAM case (controlDict with a
-    forceCoeffs function object, the freestream/attitude as a rotated inlet
+  * `OpenFOAMSolver` — a REAL adapter. It writes a valid OpenFOAM case (controlDict
+    with a forceCoeffs function object, the freestream/attitude as a rotated inlet
     velocity), can invoke `simpleFoam` when OpenFOAM is on PATH, and parses
     postProcessing/forceCoeffs output back into a CoeffResult. With no OpenFOAM
     install it still writes the case and raises SolverUnavailable from run_case.
 
-  * `FluentSolver` / `StarCCMSolver` / `TSAutoSolver` — honest external-solver stubs,
-    kept for teams that prefer to run a real licensed solve rather than the in-house
-    estimate. They emit a correct driver file (a Fluent journal / STAR-CCM+ Java
-    macro / TS-Auto config) that a team runs on their own licensed install, and raise
-    SolverUnavailable from run_case until that license and a results path are wired
-    in. They NEVER return a fabricated CoeffResult. These are no longer part of the
-    default Virtual Tunnel path — that path is now the self-contained
-    `FluentVerificationSolver`.
+  * `StarCCMSolver` / `FluentSolver` — honest stubs. They emit a correct driver
+    file (a STAR-CCM+ Java macro / a Fluent journal) that a team runs on their own
+    licensed install, and raise SolverUnavailable from run_case until that license
+    and a results path are wired in. They NEVER return a fabricated CoeffResult.
 """
 
 from __future__ import annotations
@@ -148,276 +132,6 @@ class ReferenceAeroModel:
 
     def read_result(self, spec: CaseSpec, workdir: str) -> CoeffResult:
         return self.run_case(spec, workdir)
-
-
-# --------------------------------------------------------------------------- #
-#  Fluent verification backend — the self-contained default of the Virtual Tunnel
-#  Computes coefficients IN-HOUSE; writes an ANSYS Fluent journal to verify against
-# --------------------------------------------------------------------------- #
-class FluentVerificationSolver:
-    """
-    The default Virtual (Wind) Tunnel backend, and the one that makes the feature
-    usable with NOTHING installed.
-
-    Two jobs, kept deliberately separate so the second never blocks the first:
-
-      1. ANSWER IN-HOUSE.  KinematiK computes the aero coefficients itself, with no
-         ANSYS Fluent, license, mesh or external solver needed. Two fidelity levels
-         are available via `method`:
-
-           * "panel"    — a 3D source-panel (boundary-element) potential-flow solve
-                          on the team's ACTUAL STL, with a ground-image plane. The
-                          pressure field, ground effect and downforce trend come from
-                          the geometry, not a curve fit, so geometry deltas are
-                          meaningful. Inviscid: no separation/stall/wake (that is what
-                          the Fluent deck checks). This is the higher-fidelity path.
-           * "analytic" — the transparent analytic attitude surrogate
-                          (`ReferenceAeroModel`): instant, geometry-insensitive, for
-                          plumbing and trends.
-           * "auto"     — (default) try the panel solve on the supplied geometry; if
-                          there is no usable STL (or trimesh is missing), fall back to
-                          the analytic surrogate, recording WHY in the result notes.
-
-         Either way the user gets a number back from `run_case` with nothing installed.
-
-      2. WRITE A FLUENT DECK TO VERIFY.  For every case it ALSO writes a complete,
-         ready-to-run ANSYS Fluent journal (`<case>.jou`) with the freestream vector
-         (yaw/pitch folded in), reference values and a coefficient-report/export
-         block. That deck is the user's independent check: run it on a licensed
-         Fluent install when you want to confirm the in-house number. It is a
-         verification artefact, never a prerequisite.
-
-    HONESTY CONTRACT.  The headline coefficient is labelled exactly for what it is —
-    a potential-flow / analytic in-house estimate at `POTENTIAL` fidelity,
-    `is_correlated=False` — not a Navier–Stokes solve, and the provenance/notes say
-    so on every result, including which method actually produced it. The Fluent
-    journal is generated for confirmation; KinematiK does not launch Fluent and never
-    reads back a Fluent number unless you point it at one via `read_fluent_csv`.
-    Nothing is fabricated: the estimate is openly an estimate.
-
-    Why Fluent specifically: it is the single solver the verification deck targets,
-    replacing the old Star-CCM+ / TS-Auto / OpenFOAM multi-code generation. One code,
-    one deck, and a number you already have before you ever open it.
-    """
-    name = "fluent"
-
-    def __init__(self,
-                 fidelity: SolverFidelity = SolverFidelity.POTENTIAL,
-                 model: "Optional[ReferenceAeroModel]" = None,
-                 method: str = "auto",
-                 panel_params: "Optional[object]" = None):
-        if method not in ("auto", "panel", "analytic"):
-            raise ValueError("method must be 'auto', 'panel' or 'analytic'")
-        # The analytic surrogate, used directly ("analytic") or as the "auto"/panel
-        # fallback when no usable geometry is present.
-        self.model = model if model is not None else ReferenceAeroModel()
-        self.fidelity = fidelity
-        self.method = method
-        # Lazily built panel engine (imported here to avoid a hard numpy/trimesh
-        # dependency for callers that only ever use the analytic path).
-        self._panel = None
-        if method in ("auto", "panel"):
-            from .panel_method import PanelMethodModel, PanelParams
-            self._panel = PanelMethodModel(panel_params or PanelParams())
-
-    def provenance(self) -> CFDProvenance:
-        if self.method == "analytic":
-            tm = "none (in-house analytic surrogate)"
-            how = ("Computed internally from the analytic attitude surrogate so no "
-                   "ANSYS Fluent license, mesh or external solver is required. ")
-        elif self.method == "panel":
-            tm = "none (in-house 3D panel / potential flow)"
-            how = ("Computed internally by a 3D source-panel (boundary-element) "
-                   "potential-flow solve on your STL, with a ground-image plane, so "
-                   "no ANSYS Fluent license or external solver is required. ")
-        else:  # auto
-            tm = "none (in-house panel solve, analytic fallback)"
-            how = ("Computed internally — a 3D source-panel potential-flow solve on "
-                   "your STL when geometry is available, otherwise the analytic "
-                   "surrogate — so no ANSYS Fluent license or external solver is "
-                   "required. ")
-        return CFDProvenance(
-            backend=self.name,
-            fidelity=self.fidelity,
-            is_correlated=False,
-            turbulence_model=tm,
-            notes=("In-house KinematiK aero estimate — NOT a Navier–Stokes solve. "
-                   + how +
-                   "A ready-to-run ANSYS Fluent journal is written alongside each "
-                   "case so you can independently VERIFY this number on your own "
-                   "licensed Fluent. Correlate against a tunnel/coastdown point "
-                   "before trusting absolute levels; trust deltas more than levels."),
-        )
-
-    # -- the Fluent verification deck ------------------------------------- #
-    def write_case(self, spec: CaseSpec, workdir: str,
-                   estimate: "Optional[CoeffResult]" = None) -> str:
-        """
-        Write a RUNNABLE ANSYS Fluent validation journal for one case and return its
-        path. The deck reads the team's meshed case, sets the freestream from the
-        attitude, configures k-omega SST, initialises, iterates, and exports the
-        coefficient CSV that `read_fluent_csv` ingests — so a licensed-Fluent run
-        flows straight back into the tunnel correlation.
-
-        Per-run, site-specific bits (the meshed case file and the wall zone name(s)
-        the force report targets) are read from `spec.extra` with sane defaults:
-            spec.extra['case_file']   -> the .cas/.msh to read   (default geometry_path)
-            spec.extra['wall_zones']  -> wall zone name(s)        (default "car")
-            spec.extra['inlet_zone']  -> velocity-inlet zone      (default "inlet")
-        Pass `estimate` to print the in-house number in the header for comparison.
-        """
-        from .fluent_journal import write_runnable_journal
-        est = estimate if estimate is not None else self._estimate(spec)
-        return write_runnable_journal(spec, workdir, estimate=est)
-
-    def _write_stub_case(self, spec: CaseSpec, workdir: str,
-                         estimate: "Optional[CoeffResult]" = None) -> str:
-        """
-        The original header-only stub deck (kept for reference / fallback). Prints
-        reference values and the in-house estimate but leaves the solve as TODOs;
-        it does NOT run end to end. Prefer `write_case` (runnable).
-        """
-        os.makedirs(workdir, exist_ok=True)
-        ux, uy, uz = OpenFOAMSolver._inlet_velocity(spec.attitude)
-        a = spec.attitude
-        # The in-house estimate, embedded in the deck header so the user can compare
-        # at a glance once Fluent finishes.
-        est = estimate if estimate is not None else self._estimate(spec)
-        cl_est = "n/a" if est.c_lift is None else f"{est.c_lift:+.4f}"
-        cd_est = "n/a" if est.c_drag is None else f"{est.c_drag:+.4f}"
-        path = os.path.join(workdir, spec.case_name() + ".jou")
-        jou = f""";; ===========================================================================
-;; KinematiK-generated ANSYS Fluent verification journal — {spec.case_name()}
-;; Attitude: {spec.attitude.label()}
-;;
-;; PURPOSE: this deck is OPTIONAL. KinematiK has already computed an in-house
-;; estimate for this case (see below); run this journal only if you want to verify
-;; that estimate on your own licensed ANSYS Fluent install.
-;;
-;; KinematiK in-house estimate (our sign convention, C_l negative = downforce):
-;;     C_l ~= {cl_est}    C_d ~= {cd_est}
-;;
-;; Run:  fluent 3ddp -g -i {spec.case_name()}.jou      (on a licensed install)
-;; ===========================================================================
-/file/read-case "{spec.geometry_path}"
-;; ---- freestream (yaw/pitch folded into the inlet vector), m/s ----
-;;   Ux={ux:.5f}  Uy={uy:.5f}  Uz={uz:.5f}   rho={spec.rho}
-;;   magUInf={a.speed_ms}  Aref={spec.reference_area_m2}  Lref={spec.reference_length_m}
-;;   attitude: roll={a.roll_deg} pitch={a.pitch_deg} yaw={a.yaw_deg} ride_height_mm={a.ride_height_mm}
-;; ---- TODO(team): set the velocity-inlet components to (Ux,Uy,Uz), set the
-;;   reference values (area, length, density, velocity), initialise, and iterate
-;;   to convergence. Then export the force/moment coefficients: ----
-/report/reference-values/area {spec.reference_area_m2}
-/report/reference-values/length {spec.reference_length_m}
-/report/reference-values/density {spec.rho}
-/report/reference-values/velocity {a.speed_ms}
-/report/forces/wall-forces yes 0 0 1     ; lift  (Fz)
-/report/forces/wall-forces yes 1 0 0     ; drag  (Fx)
-;; export a coefficient CSV "{spec.case_name()}_coeffs.csv" with columns:
-;;     Cl,Cd,Cs,CmPitch,converged
-;; then, back in KinematiK:
-;;     FluentVerificationSolver().read_fluent_csv(spec, workdir)
-;; to compare the licensed-solver number against the in-house estimate above.
-/exit yes
-"""
-        with open(path, "w") as f:
-            f.write(jou)
-        return path
-
-    # -- the in-house answer (no external solver needed) ------------------ #
-    def _analytic_estimate(self, spec: CaseSpec) -> CoeffResult:
-        """The transparent analytic attitude surrogate (geometry-insensitive)."""
-        c_lift, c_drag, c_side, front = self.model._coeffs(spec.attitude)
-        return CoeffResult(
-            attitude=spec.attitude,
-            c_lift=c_lift, c_drag=c_drag, c_side=c_side,
-            c_pitch=None,
-            aero_balance_front=front,
-            converged=True,                 # the analytic surrogate is exact by construction
-            force_monitor_range=0.0,
-            provenance=self.provenance(),
-            notes=("in-house analytic surrogate; an ANSYS Fluent verification journal "
-                   "was written alongside this case for optional confirmation"),
-        )
-
-    def _estimate(self, spec: CaseSpec) -> CoeffResult:
-        """
-        Compute the coefficients internally. Dispatch on `method`:
-          * "analytic" -> the surrogate,
-          * "panel"    -> the 3D panel solve (propagates its error if geometry is bad),
-          * "auto"     -> try the panel solve, fall back to the surrogate on any
-                          PanelMethodUnavailable, recording WHY in the notes.
-        A Fluent verification deck is written for the case regardless.
-        """
-        if self.method == "analytic" or self._panel is None:
-            return self._analytic_estimate(spec)
-
-        from .panel_method import PanelMethodUnavailable
-        if self.method == "panel":
-            res = self._panel.solve(spec)            # may raise PanelMethodUnavailable
-            res.notes = (res.notes + "; ANSYS Fluent verification journal written "
-                         "alongside for optional confirmation")
-            return res
-
-        # auto: panel first, analytic fallback with an honest reason
-        try:
-            res = self._panel.solve(spec)
-            res.notes = (res.notes + "; ANSYS Fluent verification journal written "
-                         "alongside for optional confirmation")
-            return res
-        except PanelMethodUnavailable as e:
-            res = self._analytic_estimate(spec)
-            res.notes = (f"panel solve unavailable ({e}); fell back to the analytic "
-                         "surrogate. " + res.notes)
-            return res
-
-    def run_case(self, spec: CaseSpec, workdir: str) -> CoeffResult:
-        """
-        Return the in-house coefficient estimate, and write the Fluent verification
-        journal as a side effect. This NEVER raises SolverUnavailable — the whole
-        design goal is that the user always gets an answer from KinematiK alone, with
-        the Fluent deck left on disk to confirm it if they choose.
-        """
-        t0 = time.time()
-        res = self._estimate(spec)                       # solve once
-        self.write_case(spec, workdir, estimate=res)     # reuse it in the deck header
-        res.wall_clock_s = time.time() - t0
-        return res
-
-    def read_result(self, spec: CaseSpec, workdir: str) -> CoeffResult:
-        """
-        Read back a result for this case. If the user has run the Fluent deck and
-        staged `<case>_coeffs.csv`, return THAT (the licensed-solver verification);
-        otherwise fall back to the in-house estimate so a read never fails. Either
-        way the deck is (re)written so it is always available.
-        """
-        csv = os.path.join(workdir, spec.case_name() + "_coeffs.csv")
-        if os.path.isfile(csv):
-            self.write_case(spec, workdir)
-            return self.read_fluent_csv(spec, workdir)
-        res = self._estimate(spec)
-        self.write_case(spec, workdir, estimate=res)
-        return res
-
-    def read_fluent_csv(self, spec: CaseSpec, workdir: str) -> CoeffResult:
-        """
-        Parse a Fluent-exported `<case>_coeffs.csv` (Cl,Cd,Cs,CmPitch,converged) the
-        user produced by running the verification deck. Use this to fold the licensed
-        solver's confirmation back into KinematiK. Raises SolverUnavailable (not a
-        fabricated number) if the CSV is not there.
-        """
-        csv = os.path.join(workdir, spec.case_name() + "_coeffs.csv")
-        if not os.path.isfile(csv):
-            raise SolverUnavailable(
-                f"No Fluent verification CSV at {csv}. This is OPTIONAL — KinematiK's "
-                "in-house estimate is available from run_case() without it. To verify, "
-                f"run {workdir}/{spec.case_name()}.jou in licensed Fluent and export "
-                "the coefficient report there first.")
-        prov = CFDProvenance(
-            backend=self.name + ":fluent-verified", fidelity=SolverFidelity.RANS,
-            is_correlated=False, turbulence_model="(from licensed Fluent run)",
-            notes="parsed from a user-run ANSYS Fluent verification export.")
-        return _read_simple_coeff_csv(spec, csv, prov)
 
 
 # --------------------------------------------------------------------------- #
@@ -750,16 +464,10 @@ public class {spec.case_name()} extends StarMacro {{
 # --------------------------------------------------------------------------- #
 class FluentSolver:
     """
-    ANSYS Fluent external-solver STUB. Same discipline as the STAR-CCM+ stub: writes
-    a TUI journal the team runs on their licensed Fluent, refuses to fabricate a run.
-
-    NOTE: this is the pure pass-through stub (it computes NOTHING in-house and raises
-    SolverUnavailable from run_case). The default Virtual Tunnel path is instead
-    `FluentVerificationSolver`, which computes the coefficients in-house AND writes a
-    Fluent deck to verify. Use this stub directly only if you specifically want a
-    Fluent deck with no in-house estimate attached.
+    ANSYS Fluent adapter STUB. Same discipline as the STAR-CCM+ stub: writes a TUI
+    journal the team runs on their licensed Fluent, refuses to fabricate a run.
     """
-    name = "fluent-stub"
+    name = "fluent"
 
     def __init__(self, fidelity: SolverFidelity = SolverFidelity.RANS):
         self.fidelity = fidelity
@@ -939,31 +647,38 @@ def _make_ensemble(**kwargs):
 
 BACKENDS = {
     "reference": ReferenceAeroModel,
-    "fluent": FluentVerificationSolver,      # in-house estimate + Fluent deck (default)
-    "fluent-stub": FluentSolver,             # pure pass-through Fluent deck, no estimate
     "openfoam": OpenFOAMSolver,
     "starccm": StarCCMSolver,
+    "fluent": FluentSolver,
     "tsauto": TSAutoSolver,
-    # The Virtual Tunnel Solver — now self-contained on the in-house Fluent backend.
+    # The Virtual Tunnel Solver — a meta-backend built on the three codes above.
     "virtual-tunnel": _make_ensemble,
 }
 
+# Belt-and-suspenders: guarantee the Virtual Tunnel Solver is always registered.
+# Some partial builds shipped a BACKENDS dict without this key, which surfaced to
+# users as 'unknown CFD backend "virtual-tunnel"'. Re-assert it at import time.
+BACKENDS.setdefault("virtual-tunnel", _make_ensemble)
+
 
 def get_backend(name: str, **kwargs):
-    key = name.lower().replace("-", "").replace("+", "").replace("ccm", "ccm")
+    key = name.lower().replace("-", "").replace("+", "").replace("_", "").replace(" ", "")
     aliases = {"reference": "reference", "referenceanalytic": "reference",
-               # Fluent / ANSYS resolve to the self-contained in-house verification
-               # solver (computes coefficients internally, writes a Fluent deck).
-               "fluent": "fluent", "ansys": "fluent", "ansysfluent": "fluent",
-               "fluentverify": "fluent", "fluentverification": "fluent",
-               # the pure external stub, for teams that want only the deck
-               "fluentstub": "fluent-stub",
                "openfoam": "openfoam", "of": "openfoam",
                "starccm": "starccm", "star": "starccm", "starccmplus": "starccm",
+               "fluent": "fluent", "ansys": "fluent",
                "tsauto": "tsauto", "ts": "tsauto", "totalsim": "tsauto",
                "virtualtunnel": "virtual-tunnel", "ensemble": "virtual-tunnel",
-               "vts": "virtual-tunnel", "consensus": "virtual-tunnel"}
-    cls = BACKENDS.get(aliases.get(key, key))
+               "vts": "virtual-tunnel", "consensus": "virtual-tunnel",
+               "tunnel": "virtual-tunnel", "virtual": "virtual-tunnel"}
+    resolved = aliases.get(key, key)
+    cls = BACKENDS.get(resolved)
+    # The Virtual Tunnel Solver is a meta-backend; it must always be resolvable
+    # even if the registry dict was built without it (older partial builds shipped
+    # without the entry, which surfaced as "unknown CFD backend 'virtual-tunnel'").
+    if cls is None and resolved == "virtual-tunnel":
+        cls = _make_ensemble
     if cls is None:
-        raise KeyError(f"unknown CFD backend '{name}'; have {sorted(BACKENDS)}")
+        have = sorted(set(BACKENDS) | {"virtual-tunnel"})
+        raise KeyError(f"unknown CFD backend '{name}'; have {have}")
     return cls(**kwargs)

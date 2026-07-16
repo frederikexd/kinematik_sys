@@ -62,7 +62,14 @@ def load_chassis(path: str, offset=(0.0, 0.0, 0.0), scale=1.0) -> trimesh.Trimes
     ext = os.path.splitext(path)[1].lower()
 
     if ext in (".step", ".stp"):
-        import cascadio
+        try:
+            import cascadio
+        except ImportError:
+            raise ValueError(
+                "STEP/STP import needs the 'cascadio' package, which isn't "
+                "installed in this environment (no wheel for Python 3.13+). "
+                "Either deploy on Python 3.12, or convert the file to STL/OBJ/GLB "
+                "and upload that instead.")
         with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
             glb_path = tmp.name
         cascadio.step_to_glb(path, glb_path, tol_linear=0.5, tol_angular=0.5)
@@ -93,6 +100,150 @@ def mesh_summary(mesh: trimesh.Trimesh) -> dict:
         "bbox_max": hi.tolist(),
         "size_mm": (hi - lo).tolist(),
         "watertight": bool(mesh.is_watertight),
+    }
+
+
+def _guess_unit_scale(size_mm) -> float:
+    """Guess a unit scale so a CAD part comes out in millimetres.
+
+    SolidWorks parts export in mm, m or inch and the file doesn't always say
+    which. A real FSAE part is tens-to-hundreds of mm on its largest side, so we
+    use the longest extent as a tell: ~order 1 -> metres (×1000), ~tens with a
+    non-round look -> inches (×25.4), already hundreds -> millimetres (×1). This
+    is a heuristic the user can always override with an explicit scale.
+    """
+    longest = float(max(size_mm)) if len(size_mm) else 0.0
+    if longest <= 0:
+        return 1.0
+    if longest < 5.0:          # 0..5 of something -> almost certainly metres
+        return 1000.0
+    if longest < 40.0:         # tens -> likely inches (e.g. a 12" part)
+        return 25.4
+    return 1.0                 # already hundreds -> millimetres
+
+
+def _decimate_mesh(mesh: "trimesh.Trimesh", max_faces: int) -> "trimesh.Trimesh":
+    """Reduce a mesh to roughly max_faces, degrading gracefully.
+
+    1) try trimesh's quadric simplifier (needs `fast_simplification`),
+    2) else vertex-cluster on a grid sized to hit the target (no extra deps),
+    3) else return the mesh unchanged. Never raises — a heavy part should still
+       draw, just a touch slower, rather than failing the whole car view.
+    """
+    try:
+        out = mesh.simplify_quadric_decimation(max_faces)
+        if out is not None and len(out.faces):
+            return out
+    except Exception:
+        pass
+    try:
+        out = mesh.simplify_quadratic_decimation(max_faces)  # older trimesh name
+        if out is not None and len(out.faces):
+            return out
+    except Exception:
+        pass
+    # Dependency-free fallback: snap vertices onto a grid and weld coincident
+    # ones, which collapses faces. Sized to approach the target face count.
+    try:
+        diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) or 1.0
+        pitch = diag / 60.0
+        best = mesh
+        for _ in range(7):
+            c = mesh.copy()
+            snapped = np.round(c.vertices / pitch) * pitch
+            # Re-index onto unique snapped positions so the weld actually happens.
+            uniq, inv = np.unique(snapped, axis=0, return_inverse=True)
+            new_faces = inv[c.faces]
+            # Drop faces that became degenerate (two shared verts) after welding.
+            good = (new_faces[:, 0] != new_faces[:, 1]) & \
+                   (new_faces[:, 1] != new_faces[:, 2]) & \
+                   (new_faces[:, 0] != new_faces[:, 2])
+            new_faces = new_faces[good]
+            if len(new_faces) == 0:
+                pitch /= 1.6
+                continue
+            c2 = trimesh.Trimesh(vertices=uniq, faces=new_faces, process=True)
+            best = c2
+            if len(c2.faces) <= max_faces:
+                break
+            pitch *= 1.5
+        if len(best.faces):
+            return best
+    except Exception:
+        pass
+    return mesh
+
+
+def load_part_mesh(path: str, *, max_faces: int = 4000,
+                   unit_scale: float | str = "auto") -> dict:
+    """Load a CAD part (STEP/STL/OBJ/GLB) into a renderable, normalised payload.
+
+    Unlike load_chassis (which keeps the mesh in its export frame for distance
+    checks), this prepares a part to be DRAWN on the full-car model:
+      * tessellates STEP via cascadio, loads mesh formats via trimesh,
+      * converts to millimetres (auto-guess or explicit unit_scale),
+      * recentres on its bounding-box centre so the user positions it by centre,
+      * decimates to <= max_faces so the 3D scene stays responsive.
+
+    Returns a dict the renderer and session-state can hold (plain lists, JSON-safe):
+        verts   : list[[x,y,z]]   recentred, in mm
+        faces   : list[[i,j,k]]
+        size_mm : [lx,ly,lz]      extents after unit scaling
+        unit_scale, triangles
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".step", ".stp"):
+        try:
+            import cascadio
+        except ImportError:
+            raise ValueError(
+                "STEP/STP import needs the 'cascadio' package, which isn't "
+                "installed in this environment (no wheel for Python 3.13+). "
+                "Either deploy on Python 3.12, or convert the file to STL/OBJ/GLB "
+                "and upload that instead.")
+        with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+            glb_path = tmp.name
+        cascadio.step_to_glb(path, glb_path, tol_linear=0.1, tol_angular=0.3)
+        scene = trimesh.load(glb_path, force="scene")
+        os.unlink(glb_path)
+    else:
+        scene = trimesh.load(path, force="scene")
+
+    if isinstance(scene, trimesh.Scene):
+        geoms = [g for g in scene.geometry.values()
+                 if isinstance(g, trimesh.Trimesh) and len(g.faces)]
+        if not geoms:
+            raise ValueError("No drawable mesh geometry found in the file.")
+        mesh = trimesh.util.concatenate(geoms)
+    else:
+        mesh = scene
+    if mesh is None or len(mesh.faces) == 0:
+        raise ValueError("No drawable mesh geometry found in the file.")
+
+    size_raw = (mesh.bounds[1] - mesh.bounds[0])
+    if unit_scale == "auto":
+        scl = _guess_unit_scale(size_raw)
+    else:
+        scl = float(unit_scale)
+    if scl != 1.0:
+        mesh.apply_scale(scl)
+
+    # Decimate heavy tessellations so plotly stays smooth. Prefer a real quadric
+    # simplifier when present; otherwise fall back to dependency-free vertex
+    # clustering so the feature still works on a stock install (Streamlit Cloud).
+    if len(mesh.faces) > max_faces:
+        mesh = _decimate_mesh(mesh, max_faces)
+
+    # Recentre on the bbox centre: the user then places it by its own centre.
+    ctr = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
+    verts = (mesh.vertices - ctr)
+    size_mm = (mesh.bounds[1] - mesh.bounds[0])
+    return {
+        "verts": verts.astype(float).tolist(),
+        "faces": mesh.faces.astype(int).tolist(),
+        "size_mm": [float(size_mm[0]), float(size_mm[1]), float(size_mm[2])],
+        "unit_scale": float(scl),
+        "triangles": int(len(mesh.faces)),
     }
 
 

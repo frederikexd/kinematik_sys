@@ -3,151 +3,224 @@
 #  Created by Frederik Thio. Copyright (c) 2026 Frederik Thio.
 #  Open source. Original author: Frederik Thio, creator of KinematiK.
 # ============================================================================
+"""suspension.aero — lazy subpackage facade (PEP 562).
 
-"""
-KinematiK aero co-simulation package.
-
-The aero analogue of `tire_cosim`: a clean, typed, tested SEAM where an external
-CFD solver (OpenFOAM / STAR-CCM+ / Fluent) plugs in, an orchestrator that sweeps
-car attitude into an aero map, and a coupling that feeds that map back into the
-existing point-mass lap sim. KinematiK owns the parameterisation, orchestration and
-map; the meshing and the Navier–Stokes solve live OUTSIDE it, on the team's cluster
-with the team's license. Provenance is first-class throughout — a CFD number is
-never fabricated to fill a hole.
+Same contract as the parent package: ``import suspension.aero`` is inert;
+every submodule and re-exported symbol loads on first attribute touch only.
 
 Two entry paths:
-  * "A" — orchestrate runs:  AeroOrchestrator(backend, geometry).run(RunMatrix(...))
-  * "B" — bring a map:        AeroMap.from_csv(text)  ->  AeroProvider(...)
+  A — orchestrate runs:  AeroOrchestrator(backend, geometry).run(RunMatrix(...))
+  B — bring a map:       AeroMap.from_csv(text) -> AeroProvider(...)
 
-Virtual Wind Tunnel (the CFD-validation path):
-    A physical aero-map run in a wind tunnel exists mainly to CALIBRATE CFD: map the
-    car over front/rear ride height, then run the IDENTICAL points in CFD and check
-    that C_d/C_l/balance match. `windtunnel.py` owns that loop:
-        from suspension.aero import (PhysicalAeroMap, TunnelProvenance, RideHeights,
-                                     VirtualWindTunnel, StarCCMSolver)
-        phys = PhysicalAeroMap(TunnelProvenance("A2"), reference_area_m2=1.0)
-        phys.add_measurement(RideHeights(20, 40, 25.0), c_lift=-2.8, c_drag=1.05)
-        vwt = VirtualWindTunnel(phys, "car.stl")
-        specs = vwt.case_specs()           # exact same points, for Star-CCM+/TS-Auto
-        # ... team runs the CFD, reads results back ...
-        report = vwt.correlate(cfd_results)  # is k-omega SST calibrated to the tunnel?
+Virtual Wind Tunnel (CFD-validation path):
+    from suspension.aero import PhysicalAeroMap, TunnelProvenance, VirtualWindTunnel
+    phys = PhysicalAeroMap(TunnelProvenance("A2"), reference_area_m2=1.0)
+    phys.add_measurement(RideHeights(20, 40, 25.0), c_lift=-2.8, c_drag=1.05)
+    vwt  = VirtualWindTunnel(phys, "car.stl")
+    report = vwt.correlate(cfd_results)
 
-Surface pressure taps (the where-is-it-loaded path):
-    The coefficient correlation says how much downforce; the C_p field says WHERE it
-    comes from and whether the wing has stalled. `pressure_tap.py` turns a run's raw
-    transducer voltages into a non-dimensional C_p mapped onto the wing, then RMSEs it
-    against the CFD surface tap-for-tap:
-        from suspension.aero import (RawPressureScan, ScanProvenance, TapLocation,
-                                     TapCalibration, CFDSurfaceCp, correlate_cp)
-        scan = RawPressureScan(volts, taps, calibrations)   # off the DAQ
-        cp   = scan.to_cp(ScanProvenance("A2", speed_ms=25))  # volts -> C_p on the wing
-        print(cp.stall_indicator("main").note)              # where is it stalling?
-        report = correlate_cp(cp, cfd_surface_cp)            # RMSE vs CFD surface C_p
-
-Live acquisition (the off-the-hardware path, upstream of everything above):
-    The car is bolted to an under-floor multi-axis force balance and skinned with
-    hundreds of static pressure taps plumbed into electronic scanners (Scanivalve,
-    Chell nanoDAQ), all clocked by a high-speed DAQ chassis. `daq.py` owns that front
-    end: a Virtual Instrument binds the balance + scanners to the chassis through a
-    backend, samples at kHz, NOTCHES the fan blade-pass tone and structural vibration
-    out before averaging, decouples the balance through its interaction matrix, and
-    streams CLEAN time-averaged raw forces (F_x, F_y, F_z) and a RawPressureScan that
-    `to_cp` then turns into the C_p field above:
-        from suspension.aero import (DAQChassis, BalanceCalibration, ForceBalanceSpec,
-                                     PressureScannerSpec, ScannerVendor, VibrationFilter,
-                                     AcquisitionSpec, SyntheticDAQ, VirtualInstrument)
-        vi = VirtualInstrument(facility="A2", chassis=DAQChassis(2000.0),
-                               balance=balance, scanners=[scanner], backend=backend)
-        spec = AcquisitionSpec(seconds=10, speed_ms=25,
-                               vibration=VibrationFilter(2000.0, fan_blade_pass_hz=137))
-        forces, scan = vi.acquire(spec)         # clean F_x/F_y/F_z + raw P_static
-        cp = scan.to_cp(vi.scan_provenance(spec))
+Plug & layup build planning (Frame Planner / aero manufacturing path):
+    from suspension.aero import (NoseconeBody, FoamSheet, SlicePlan,
+                                  LayupRecipe, MaterialsEstimate,
+                                  BuildDaySchedule, PlugBuildPlan)
+    body  = NoseconeBody(length_mm=520, base_width_mm=250, base_height_mm=260)
+    plan  = SlicePlan.plan(body, FoamSheet(thickness_mm=25.4))
+    bom   = MaterialsEstimate.compute(body, plan, LayupRecipe())
+    sched = BuildDaySchedule.plan(...)
 
 Quick start (runnable today, no solver):
-    from suspension.aero import (ReferenceAeroModel, AeroOrchestrator, RunMatrix)
+    from suspension.aero import ReferenceAeroModel, AeroOrchestrator, RunMatrix
     orch = AeroOrchestrator(ReferenceAeroModel(), "car.stl", reference_area_m2=1.0)
-    print(orch.plan(RunMatrix(yaw_deg=[0,2,4,6])))     # cost preview
     report = orch.run(RunMatrix(yaw_deg=[0,2,4,6]), workdir="/tmp/sweep")
-    amap = report.aero_map
 """
+import importlib
 
-from .cfd import (
-    Attitude, RunMatrix, CaseSpec, CoeffResult, CFDProvenance,
-    SolverFidelity, CFDSolver, SolverUnavailable,
-)
-from .backends import (
-    ReferenceAeroModel, FluentVerificationSolver, OpenFOAMSolver, StarCCMSolver,
-    FluentSolver, TSAutoSolver, BACKENDS, get_backend,
-)
-from .panel_method import (
-    PanelMethodModel, PanelParams, PanelMethodUnavailable,
-)
-from .ensemble import (
-    EnsembleTunnelSolver, EnsembleResult, MemberOutcome, fused_results,
-    DEFAULT_MEMBER_NAMES,
-)
-from .submit import (
-    Submitter, LocalSubmitter, SlurmSSHSubmitter, SubmitResult,
-)
-from .aeromap import AeroMap, AeroQuery
-from .orchestrator import AeroOrchestrator, OrchestratorReport
-from .coupling import AeroProvider, estimate_attitude, attitude_from_dynamics
-from .meshing import MeshParams, SnappyMesher, parse_checkmesh
-from .windtunnel import (
-    RideHeights, AeroMapGrid, GroundState, TunnelProvenance, PhysicalAeroMap,
-    VirtualWindTunnel, PointCorrelation, TunnelCorrelationReport,
-    ride_heights_to_attitude, attitude_to_ride_heights,
-    downforce_to_clift, drag_to_cdrag, DEFAULT_TUNNEL_TOL,
-)
-from .piv import (
-    SheetOrientation, LaserSheetPlane, PIVProvenance, FramePair, VelocityField,
-    PIVProcessor, AcquisitionPlan, PIVRig, OfflinePIVRig, RigUnavailable,
-    CFDFieldSlice, FieldCorrelationReport, correlate_field, separation_mask,
-    DEFAULT_FIELD_TOL,
-)
-from .pressure_tap import (
-    WingSurface, TapLocation, TapCalibration, ScanProvenance, RawPressureScan,
-    CpField, StallVerdict, CFDSurfaceCp, TapResidual, CpCorrelationReport,
-    correlate_cp, DEFAULT_CP_TOL,
-)
-from .daq import (
-    BalanceAxis, BalanceCalibration, ScannerVendor, PressureScannerSpec,
-    ForceBalanceSpec, DAQChassis, VibrationFilter, VibrationFilterReport,
-    ChannelFilter, StreamingVibrationFilter,
-    AcquisitionSpec, DAQProvenance, BalanceReading, DAQBackend, DAQUnavailable,
-    OfflineDAQ, SyntheticDAQ, VirtualInstrument,
+# ---------------------------------------------------------------------------
+#  Submodules — anything importable as suspension.aero.<name>.
+# ---------------------------------------------------------------------------
+_SUBMODULES = {
+    "aeromap", "backends", "cfd", "coupling", "daq", "ensemble",
+    "fluent_journal", "meshing", "orchestrator", "panel_method",
+    "piv", "plug_builder", "pressure_tap", "scale_model",
+    "submit", "windtunnel",
+}
+
+# ---------------------------------------------------------------------------
+#  Symbol -> home submodule for every re-exported name.
+# ---------------------------------------------------------------------------
+_SYMBOL_HOME = {
+    # cfd
+    "Attitude":             "cfd",
+    "RunMatrix":            "cfd",
+    "CaseSpec":             "cfd",
+    "CoeffResult":          "cfd",
+    "CFDProvenance":        "cfd",
+    "SolverFidelity":       "cfd",
+    "CFDSolver":            "cfd",
+    "SolverUnavailable":    "cfd",
+    # backends
+    "ReferenceAeroModel":   "backends",
+    "FluentVerificationSolver": "backends",
+    "OpenFOAMSolver":       "backends",
+    "StarCCMSolver":        "backends",
+    "FluentSolver":         "backends",
+    "TSAutoSolver":         "backends",
+    "BACKENDS":             "backends",
+    "get_backend":          "backends",
+    # panel_method
+    "PanelMethodModel":     "panel_method",
+    "PanelParams":          "panel_method",
+    "PanelMethodUnavailable": "panel_method",
+    # ensemble
+    "EnsembleTunnelSolver": "ensemble",
+    "EnsembleResult":       "ensemble",
+    "MemberOutcome":        "ensemble",
+    "fused_results":        "ensemble",
+    "DEFAULT_MEMBER_NAMES": "ensemble",
+    # submit
+    "Submitter":            "submit",
+    "LocalSubmitter":       "submit",
+    "SlurmSSHSubmitter":    "submit",
+    "SubmitResult":         "submit",
+    # aeromap
+    "AeroMap":              "aeromap",
+    "AeroQuery":            "aeromap",
+    # orchestrator
+    "AeroOrchestrator":     "orchestrator",
+    "OrchestratorReport":   "orchestrator",
+    # coupling
+    "AeroProvider":         "coupling",
+    "estimate_attitude":    "coupling",
+    "attitude_from_dynamics": "coupling",
+    # meshing
+    "MeshParams":           "meshing",
+    "SnappyMesher":         "meshing",
+    "parse_checkmesh":      "meshing",
+    # windtunnel
+    "RideHeights":          "windtunnel",
+    "AeroMapGrid":          "windtunnel",
+    "GroundState":          "windtunnel",
+    "TunnelProvenance":     "windtunnel",
+    "PhysicalAeroMap":      "windtunnel",
+    "VirtualWindTunnel":    "windtunnel",
+    "PointCorrelation":     "windtunnel",
+    "TunnelCorrelationReport": "windtunnel",
+    "ride_heights_to_attitude": "windtunnel",
+    "attitude_to_ride_heights": "windtunnel",
+    "downforce_to_clift":   "windtunnel",
+    "drag_to_cdrag":        "windtunnel",
+    "DEFAULT_TUNNEL_TOL":   "windtunnel",
+    # piv
+    "SheetOrientation":     "piv",
+    "LaserSheetPlane":      "piv",
+    "PIVProvenance":        "piv",
+    "FramePair":            "piv",
+    "VelocityField":        "piv",
+    "PIVProcessor":         "piv",
+    "AcquisitionPlan":      "piv",
+    "PIVRig":               "piv",
+    "OfflinePIVRig":        "piv",
+    "RigUnavailable":       "piv",
+    "CFDFieldSlice":        "piv",
+    "FieldCorrelationReport": "piv",
+    "correlate_field":      "piv",
+    "separation_mask":      "piv",
+    "DEFAULT_FIELD_TOL":    "piv",
+    # pressure_tap
+    "WingSurface":          "pressure_tap",
+    "TapLocation":          "pressure_tap",
+    "TapCalibration":       "pressure_tap",
+    "ScanProvenance":       "pressure_tap",
+    "RawPressureScan":      "pressure_tap",
+    "CpField":              "pressure_tap",
+    "StallVerdict":         "pressure_tap",
+    "CFDSurfaceCp":         "pressure_tap",
+    "TapResidual":          "pressure_tap",
+    "CpCorrelationReport":  "pressure_tap",
+    "correlate_cp":         "pressure_tap",
+    "DEFAULT_CP_TOL":       "pressure_tap",
+    # daq
+    "BalanceAxis":          "daq",
+    "BalanceCalibration":   "daq",
+    "ScannerVendor":        "daq",
+    "PressureScannerSpec":  "daq",
+    "ForceBalanceSpec":     "daq",
+    "DAQChassis":           "daq",
+    "VibrationFilter":      "daq",
+    "VibrationFilterReport": "daq",
+    "ChannelFilter":        "daq",
+    "StreamingVibrationFilter": "daq",
+    "AcquisitionSpec":      "daq",
+    "DAQProvenance":        "daq",
+    "BalanceReading":       "daq",
+    "DAQBackend":           "daq",
+    "DAQUnavailable":       "daq",
+    "OfflineDAQ":           "daq",
+    "SyntheticDAQ":         "daq",
+    "VirtualInstrument":    "daq",
+    # scale_model
+    "ScaleSpec":            "scale_model",
+    "SimilitudePlan":       "scale_model",
+    "ToleranceBudget":      "scale_model",
+    "ToleranceReport":      "scale_model",
+    "MountAlignment":       "scale_model",
+    "ScaledRunPlan":        "scale_model",
+    "reynolds":             "scale_model",
+    "air_kinematic_viscosity": "scale_model",
+    "DEFAULT_AIR_DENSITY":  "scale_model",
+    "DEFAULT_AIR_KINEMATIC_VISCOSITY": "scale_model",
+    "LOW_RE_BUBBLE_THRESHOLD": "scale_model",
+    # plug_builder
+    "NoseconeBody":         "plug_builder",
+    "FoamSheet":            "plug_builder",
+    "FoamLayer":            "plug_builder",
+    "StackTolerance":       "plug_builder",
+    "SlicePlan":            "plug_builder",
+    "layer_template_svg":   "plug_builder",
+    "LayupRecipe":          "plug_builder",
+    "BOMLine":              "plug_builder",
+    "MaterialsEstimate":    "plug_builder",
+    "BuildStep":            "plug_builder",
+    "default_build_day":    "plug_builder",
+    "ScheduledStep":        "plug_builder",
+    "BuildDaySchedule":     "plug_builder",
+    "GateItem":             "plug_builder",
+    "PreflightGate":        "plug_builder",
+    "PlugBuildPlan":        "plug_builder",
+}
+
+# Fallback scan order when a _SYMBOL_HOME entry is wrong/missing.
+_FALLBACK_SCAN = (
+    "cfd", "backends", "aeromap", "orchestrator", "coupling", "meshing",
+    "windtunnel", "piv", "pressure_tap", "daq", "scale_model",
+    "plug_builder", "ensemble", "submit", "panel_method",
 )
 
-__all__ = [
-    "Attitude", "RunMatrix", "CaseSpec", "CoeffResult", "CFDProvenance",
-    "SolverFidelity", "CFDSolver", "SolverUnavailable",
-    "ReferenceAeroModel", "FluentVerificationSolver", "OpenFOAMSolver",
-    "StarCCMSolver", "FluentSolver",
-    "TSAutoSolver", "BACKENDS", "get_backend",
-    "PanelMethodModel", "PanelParams", "PanelMethodUnavailable",
-    "EnsembleTunnelSolver", "EnsembleResult", "MemberOutcome", "fused_results",
-    "DEFAULT_MEMBER_NAMES",
-    "Submitter", "LocalSubmitter", "SlurmSSHSubmitter", "SubmitResult",
-    "AeroMap", "AeroQuery",
-    "AeroOrchestrator", "OrchestratorReport",
-    "AeroProvider", "estimate_attitude", "attitude_from_dynamics",
-    "MeshParams", "SnappyMesher", "parse_checkmesh",
-    "RideHeights", "AeroMapGrid", "GroundState", "TunnelProvenance",
-    "PhysicalAeroMap", "VirtualWindTunnel", "PointCorrelation",
-    "TunnelCorrelationReport", "ride_heights_to_attitude",
-    "attitude_to_ride_heights", "downforce_to_clift", "drag_to_cdrag",
-    "DEFAULT_TUNNEL_TOL",
-    "SheetOrientation", "LaserSheetPlane", "PIVProvenance", "FramePair",
-    "VelocityField", "PIVProcessor", "AcquisitionPlan", "PIVRig",
-    "OfflinePIVRig", "RigUnavailable", "CFDFieldSlice",
-    "FieldCorrelationReport", "correlate_field", "separation_mask",
-    "DEFAULT_FIELD_TOL",
-    "WingSurface", "TapLocation", "TapCalibration", "ScanProvenance",
-    "RawPressureScan", "CpField", "StallVerdict", "CFDSurfaceCp",
-    "TapResidual", "CpCorrelationReport", "correlate_cp", "DEFAULT_CP_TOL",
-    "BalanceAxis", "BalanceCalibration", "ScannerVendor", "PressureScannerSpec",
-    "ForceBalanceSpec", "DAQChassis", "VibrationFilter", "VibrationFilterReport",
-    "ChannelFilter", "StreamingVibrationFilter",
-    "AcquisitionSpec", "DAQProvenance", "BalanceReading", "DAQBackend",
-    "DAQUnavailable", "OfflineDAQ", "SyntheticDAQ", "VirtualInstrument",
-]
+__all__ = sorted(_SUBMODULES | set(_SYMBOL_HOME))
+
+
+def __getattr__(name: str):
+    if name in _SUBMODULES:
+        mod = importlib.import_module(f".{name}", __name__)
+        globals()[name] = mod          # cache — __getattr__ never re-fires
+        return mod
+    home = _SYMBOL_HOME.get(name)
+    candidates = ([home] if home else []) + [m for m in _FALLBACK_SCAN
+                                              if m != home]
+    for cand in candidates:
+        try:
+            mod = importlib.import_module(f".{cand}", __name__)
+        except ImportError:
+            continue
+        if hasattr(mod, name):
+            obj = getattr(mod, name)
+            globals()[name] = obj
+            return obj
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r} — add it to "
+        f"suspension.aero.__init__._SYMBOL_HOME"
+    )
+
+
+def __dir__():
+    return __all__
