@@ -1,0 +1,53 @@
+{
+  "type": "mesh",
+  "_about": "Sample KinematiK flexible body: a front lower A-arm (two legs meeting at the lower ball joint), 1 inch x 0.065 in 4130 beam tube. Interface nodes are the two inboard pickups and the outboard ball joint. Map member LF to (lower_front_inner -> lower_ball) and LR to (lower_rear_inner -> lower_ball) in the COMPLIANCE tab or MemberStiffness.",
+  "nodes": [
+    {
+      "id": "lower_front_inner",
+      "xyz": [
+        -110.0,
+        200.0,
+        122.5
+      ]
+    },
+    {
+      "id": "lower_rear_inner",
+      "xyz": [
+        140.0,
+        200.0,
+        117.5
+      ]
+    },
+    {
+      "id": "lower_ball",
+      "xyz": [
+        -5.0,
+        575.0,
+        110.0
+      ]
+    }
+  ],
+  "elements": [
+    {
+      "n1": "lower_front_inner",
+      "n2": "lower_ball",
+      "kind": "beam",
+      "material": "Steel 4130",
+      "od_mm": 25.4,
+      "wall_mm": 1.65
+    },
+    {
+      "n1": "lower_rear_inner",
+      "n2": "lower_ball",
+      "kind": "beam",
+      "material": "Steel 4130",
+      "od_mm": 25.4,
+      "wall_mm": 1.65
+    }
+  ],
+  "interface": {
+    "lower_front_inner": "lower_front_inner",
+    "lower_rear_inner": "lower_rear_inner",
+    "lower_ball": "lower_ball"
+  }
+}

@@ -1,0 +1,126 @@
+{
+  "team_name": "Elbee Racing",
+  "season": "2026",
+  "target_mass_kg": 230.0,
+  "weights": [],
+  "decisions": [],
+  "notes": [],
+  "geometry": {
+    "points": {},
+    "keepouts": {}
+  },
+  "board": {
+    "traces": {
+      "main_feed": {
+        "name": "main_feed",
+        "net": "lv_rail",
+        "owner_subsystem": "electrics",
+        "feeds": "ecu",
+        "width_mm": 0.3,
+        "copper_oz": 1.0,
+        "length_mm": 100.0,
+        "is_external": true,
+        "is_estimate": false,
+        "set_by": "",
+        "notes": ""
+      },
+      "second": {
+        "name": "second",
+        "net": "lv_rail",
+        "owner_subsystem": "electrics",
+        "feeds": "ecu",
+        "width_mm": 0.3,
+        "copper_oz": 1.0,
+        "length_mm": 100.0,
+        "is_external": true,
+        "is_estimate": false,
+        "set_by": "",
+        "notes": ""
+      }
+    },
+    "pairs": {},
+    "aggressors": {},
+    "rail_nominal_v": 5.0,
+    "ecu_brownout_v": 4.5,
+    "ambient_c": 40.0,
+    "max_trace_temp_c": 105.0,
+    "fuse_safety_factor": 2.0,
+    "coupling_warn_mm": 2.0,
+    "coupling_fail_mm": 0.5
+  },
+  "harness": {
+    "connectors": {
+      "ECU": {
+        "name": "ECU",
+        "owner_subsystem": "electrics",
+        "xyz_mm": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "cavities": 12,
+        "part_number": "DTM-12",
+        "strain_relief_mm": 25.0,
+        "mass_g": null,
+        "is_estimate": false,
+        "set_by": "",
+        "notes": ""
+      },
+      "MOT": {
+        "name": "MOT",
+        "owner_subsystem": "electrics",
+        "xyz_mm": [
+          1200.0,
+          0.0,
+          0.0
+        ],
+        "cavities": 12,
+        "part_number": "DTM-12",
+        "strain_relief_mm": 25.0,
+        "mass_g": null,
+        "is_estimate": false,
+        "set_by": "",
+        "notes": ""
+      }
+    },
+    "wires": {
+      "MOT_PWR": {
+        "name": "MOT_PWR",
+        "owner_subsystem": "electrics",
+        "gauge_awg": 10,
+        "path_mm": [
+          [
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            10.0,
+            0.0,
+            0.0
+          ],
+          [
+            10.0,
+            10.0,
+            0.0
+          ]
+        ],
+        "from_conn": "ECU",
+        "to_conn": "MOT",
+        "net": "hv_pwr",
+        "od_mm": null,
+        "bundle_min_radius_mult": 6.0,
+        "service_loop_mm": 0.0,
+        "strip_mm": 8.0,
+        "carries_current_a": null,
+        "is_estimate": false,
+        "set_by": "",
+        "notes": ""
+      }
+    },
+    "ambient_c": 40.0,
+    "clearance_warn_mm": 10.0,
+    "clearance_fail_mm": 0.0
+  },
+  "updated": "2026-06-17T13:57:05"
+}

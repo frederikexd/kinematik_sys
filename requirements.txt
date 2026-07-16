@@ -20,13 +20,20 @@ scipy>=1.11
 plotly>=5.18
 trimesh>=4.0
 
+# Note: the cross-discipline risk-propagation + manufacturing-release-gate feature
+# (suspension/risk_propagation.py, surfaced in the Integration & DFMEA tabs) adds
+# NO new dependency — it uses only the standard library plus KinematiK's own
+# interfaces.py and dfmea.py, so it stays import-light and unit-testable in isolation.
+
 # --- optional features: imported lazily, only when the feature is used ---
 # The app boots fine without these; each one just unlocks its feature.
-cascadio>=0.0.16   # STEP/STP chassis import            (chassis.py, integration.py)
+openpyxl>=3.1      # Excel workbook read/write           (ev_electrical_check.py, ev_excel_roundtrip.py)
+cascadio>=0.0.16; python_version < "3.13"   # STEP/STP chassis import (chassis.py, integration.py). No 3.13/3.14 wheel; STEP importer degrades gracefully when absent. Pin Python to 3.12 to keep STEP import working.
+fast_simplification>=0.1   # faster CAD-part decimation for the 3D model (optional;
+                           # falls back to built-in vertex clustering if absent)
 rtree>=1.0         # chassis/part collision queries via trimesh.proximity
 reportlab>=4.0     # PDF design-handover export         (project.py: render_pdf)
-supabase>=2.0      # cloud project sync / shared setup  (project.py: SupabaseStore)
+supabase>=2.0      # cloud project sync / shared setup  (project.py: SupabaseStore;
+                   #  workspace.py: tenant-scoped backend — run workspace_isolation.sql)
 
-# --- SysBridge risk engine integration (no extra packages required) ---
-# sysbridge_engine.py and sysbridge_kinematik.py are bundled alongside app.py.
-# They use only Python stdlib (hashlib, json, math, dataclasses, enum).
+
