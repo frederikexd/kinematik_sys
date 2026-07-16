@@ -310,3 +310,105 @@ def test_full_gate_returns_all_artefacts():
                                               lo_mm=(0, 500, 0), hi_mm=(50, 600, 50))])
     assert res.cut_list and res.bom and res.mass and res.formboard is not None
     assert "FAIL" in res.summary() or "OK" in res.summary() or "WARN" in res.summary()
+
+
+# --------------------------------------------------------------------------- #
+#  Exact clearance (golden-section, not sampled) + violation location
+# --------------------------------------------------------------------------- #
+def test_clearance_is_exact_not_sampled():
+    """A wire grazing a keep-out corner BETWEEN 5 mm sample points must still be
+    measured exactly — the old point-sampling walk could miss it."""
+    from suspension.harness import _polyline_aabb_clearance_detail
+    lo, hi = np.array([100., 100., 0.]), np.array([200., 200., 50.])
+    path = np.array([[0., 95., 25.], [95., 0., 25.]])   # line x+y=95, outside
+    gap, at = _polyline_aabb_clearance_detail(path, lo, hi)
+    assert math.isclose(gap, 105.0 / math.sqrt(2.0), rel_tol=1e-9)
+    assert at is not None and math.isclose(at[0], 47.5, abs_tol=1e-3)
+
+
+def test_clearance_fail_carries_location():
+    hl = HarnessLedger()
+    hl.set_wire(WireRun("w", "electrics", gauge_awg=18,
+                        path_mm=[(0, 150, 25), (300, 150, 25)],
+                        is_estimate=False))
+    res = check_harness(hl, keepouts=[KeepOut("k", "chassis",
+                                              lo_mm=(100, 100, 0),
+                                              hi_mm=(200, 200, 50))])
+    f = next(f for f in res.findings if f.check == "harness-clearance"
+             and f.severity == Severity.FAIL)
+    assert f.detail.get("at_mm") is not None
+    assert 100 <= f.detail["at_mm"][0] <= 200
+
+
+# --------------------------------------------------------------------------- #
+#  Route anchoring: the polyline must actually reach its plugs
+# --------------------------------------------------------------------------- #
+def test_unanchored_endpoint_warns_and_anchored_does_not():
+    hl = HarnessLedger()
+    hl.set_connector(Connector("ECU", "electrics", xyz_mm=(0, 0, 0)))
+    hl.set_wire(WireRun("float", "electrics", gauge_awg=18,
+                        path_mm=[(80, 0, 0), (500, 0, 0)], from_conn="ECU"))
+    hl.set_wire(WireRun("ok", "electrics", gauge_awg=18,
+                        path_mm=[(0, 0, 0), (500, 100, 0)], from_conn="ECU"))
+    res = check_harness(hl)
+    anchors = [f for f in res.findings if f.check == "harness-anchor"]
+    assert any(f.detail.get("wire") == "float" for f in anchors)
+    assert not any(f.detail.get("wire") == "ok" for f in anchors)
+
+
+# --------------------------------------------------------------------------- #
+#  Topology-aware formboard: connectors once, ties for cycles, no pile-up
+# --------------------------------------------------------------------------- #
+def test_formboard_shared_connector_placed_once_with_tie():
+    hl = HarnessLedger()
+    hl.set_connector(Connector("ECU", "electrics", xyz_mm=(0, 0, 0)))
+    hl.set_connector(Connector("MOT", "powertrain", xyz_mm=(1000, 0, 0)))
+    hl.set_connector(Connector("BSPD", "electrics", xyz_mm=(500, 300, 0)))
+    hl.set_wire(WireRun("a", "e", gauge_awg=18, from_conn="ECU", to_conn="MOT",
+                        path_mm=[(0, 0, 0), (1000, 0, 0)]))
+    hl.set_wire(WireRun("b", "e", gauge_awg=22, from_conn="ECU", to_conn="BSPD",
+                        path_mm=[(0, 0, 0), (250, 150, 0), (500, 300, 0)]))
+    hl.set_wire(WireRun("c", "e", gauge_awg=24, from_conn="BSPD", to_conn="MOT",
+                        path_mm=[(500, 300, 0), (1000, 0, 0)]))
+    fb = hl.formboard()
+    # every named connector appears exactly once on the board
+    assert set(fb.nodes) == {"ECU", "MOT", "BSPD"}
+    # the ECU-MOT-BSPD cycle cannot be flattened length-true without one branch
+    # ending away from its (already placed) plug -> exactly that is recorded as
+    # an honest tie, never silently drawn wrong
+    assert len(fb.ties) == 1 and fb.ties[0]["connector"] in {"MOT", "BSPD"}
+    # branches are still length-true
+    for b in fb.branches:
+        pts = np.array(b.points_mm, float)
+        flat = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        assert math.isclose(flat, hl.wires[b.wire].routed_length_mm(),
+                            rel_tol=1e-3)
+
+
+def test_formboard_carries_bend_metadata():
+    hl = HarnessLedger()
+    hl.set_wire(WireRun("kink", "e", gauge_awg=10,
+                        path_mm=[(0, 0, 0), (5, 0, 0), (5, 5, 0), (500, 5, 0)]))
+    fb = hl.formboard()
+    b = fb.branches[0]
+    assert b.min_bend_radius_mm > 0
+    # at least one corner radius is recorded and tighter than the allowed min
+    finite = [r for r in b.corner_radii_mm if r is not None]
+    assert finite and min(finite) < b.min_bend_radius_mm
+
+
+def test_formboard_disconnected_components_tiled_apart():
+    hl = HarnessLedger()
+    hl.set_connector(Connector("A", "e", xyz_mm=(0, 0, 0)))
+    hl.set_connector(Connector("B", "e", xyz_mm=(200, 0, 0)))
+    hl.set_connector(Connector("C", "e", xyz_mm=(0, 500, 0)))
+    hl.set_connector(Connector("D", "e", xyz_mm=(200, 500, 0)))
+    hl.set_wire(WireRun("w1", "e", gauge_awg=20, from_conn="A", to_conn="B",
+                        path_mm=[(0, 0, 0), (200, 0, 0)]))
+    hl.set_wire(WireRun("w2", "e", gauge_awg=20, from_conn="C", to_conn="D",
+                        path_mm=[(0, 500, 0), (200, 500, 0)]))
+    fb = hl.formboard()
+    b1 = np.array(next(b for b in fb.branches if b.wire == "w1").points_mm)
+    b2 = np.array(next(b for b in fb.branches if b.wire == "w2").points_mm)
+    # the two sub-harnesses must not overlap in x on the board
+    assert b1[:, 0].max() < b2[:, 0].min() or b2[:, 0].max() < b1[:, 0].min()

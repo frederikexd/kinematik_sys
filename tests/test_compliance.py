@@ -272,7 +272,7 @@ def test_corner_wheel_load_uses_real_load_transfer():
 #  Package wiring
 # --------------------------------------------------------------------------- #
 def test_public_api_and_version():
-    assert _s.__version__ == "0.21.0"
+    assert _s.__version__ == "0.23.0"
     for name in ("CompliantCorner", "load_flex_body", "FlexMesh",
                  "MemberStiffness", "WheelLoad", "corner_wheel_load",
                  "StructuralTireModel", "ReferenceTireModel", "FTireModel",

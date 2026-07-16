@@ -243,6 +243,47 @@ def test_save_succeeds_on_local_json(tmp_path=None):
     assert s.save_error is None
 
 
+def test_note_seen_by_roundtrips_and_defaults():
+    """A note's read receipts survive save/load, and legacy rows without the
+    field load cleanly as an empty dict."""
+    from dataclasses import asdict
+    n = pj.Note(from_team="suspension", to_team="aero", message="hi", author="Alice")
+    assert n.seen_by == {}
+    # round-trip through the dict form used by the backend
+    assert pj.Note(**asdict(n)).seen_by == {}
+    # legacy row persisted before seen_by existed
+    legacy = {"from_team": "a", "to_team": "b", "message": "m",
+              "author": "Bob", "status": "open", "ts": "2026-01-01T00:00:00", "id": "x"}
+    assert pj.Note(**legacy).seen_by == {}
+    # defensive coercion of a bad type
+    assert pj.Note(from_team="a", to_team="b", message="m", seen_by=None).seen_by == {}
+
+
+def test_mark_note_seen_records_and_excludes_author():
+    import tempfile, os as _os
+    d = tempfile.mkdtemp()
+    p = _os.path.join(d, "proj.json")
+    s = pj.ProjectStore(p, backend=pj.JSONFileBackend(p))
+    s.add_note(pj.Note(from_team="suspension", to_team="aero", message="m1", author="Alice"))
+    s.add_note(pj.Note(from_team="aero", to_team="suspension", message="m2", author="Bob"))
+
+    # Bob opens the tab: he should be stamped on Alice's note but NOT his own.
+    assert s.mark_note_seen("Bob") is True
+    assert "Bob" in s.notes[0].seen_by
+    assert "Bob" not in s.notes[1].seen_by
+
+    # Idempotent: opening again changes nothing (so no needless backend write).
+    assert s.mark_note_seen("Bob") is False
+
+    # Receipts persist across a reload from the same backend.
+    s.save()
+    s2 = pj.ProjectStore(p, backend=pj.JSONFileBackend(p))
+    assert "Bob" in s2.notes[0].seen_by
+
+    # An empty viewer label is ignored.
+    assert s2.mark_note_seen("") is False
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     p = 0

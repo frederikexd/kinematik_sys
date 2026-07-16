@@ -213,12 +213,16 @@ def test_combined_slip():
 
 def test_laptime_agreement():
     print("\n[cross-validation against laptime.py]")
-    # load laptime alongside the engine (same direct-import trick)
-    path = os.path.join(_ROOT, "suspension", "laptime.py")
-    spec = importlib.util.spec_from_file_location("suspension.laptime", path)
-    lt = importlib.util.module_from_spec(spec)
-    sys.modules["suspension.laptime"] = lt
-    spec.loader.exec_module(lt)
+    # load laptime alongside the engine — but never *replace* a module that is
+    # already imported (swapping sys.modules mid-session breaks isinstance /
+    # identity checks in tests that run later).
+    lt = sys.modules.get("suspension.laptime")
+    if lt is None:
+        path = os.path.join(_ROOT, "suspension", "laptime.py")
+        spec = importlib.util.spec_from_file_location("suspension.laptime", path)
+        lt = importlib.util.module_from_spec(spec)
+        sys.modules["suspension.laptime"] = lt
+        spec.loader.exec_module(lt)
 
     veh = _veh()
     # agreement should hold across downforce levels, including wingless
