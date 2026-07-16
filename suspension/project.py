@@ -93,12 +93,67 @@ class Note:
     status: str = "open"         # "open" | "resolved"
     ts: str = ""
     id: str = ""
+    # Read receipts: who has opened the Lead Notes tab and seen this note.
+    # Keyed by a viewer label (the lead's name, or a session id if unnamed) ->
+    # ISO timestamp of first view. Lets the *poster* see "Seen by ..." so they
+    # know the note actually reached other leads, not just that it saved.
+    seen_by: dict = field(default_factory=dict)
+    # Voice-memo backup: when a note was spoken instead of typed, the ORIGINAL
+    # recording rides along with the note (base64 audio + metadata: name, ext,
+    # mime, dur, when). The transcript in `message` is what leads read; the
+    # audio is the source of truth if the transcription was off. Kept small by
+    # a size cap at the capture side; empty dict when the note was typed.
+    voice_memo: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.ts:
             self.ts = _dt.datetime.now().isoformat(timespec="seconds")
         if not self.id:
             self.id = _dt.datetime.now().strftime("%Y%m%d%H%M%S%f")
+        # Tolerate older rows persisted before seen_by existed / wrong types.
+        if not isinstance(self.seen_by, dict):
+            self.seen_by = {}
+        # Same tolerance for rows persisted before voice_memo existed.
+        if not isinstance(self.voice_memo, dict):
+            self.voice_memo = {}
+
+
+@dataclass
+class CADFile:
+    """
+    One entry in the Team CAD library — a shared SolidWorks/STEP/STL/DXF/PNG
+    file (or a link to a big assembly that's too large to embed).
+
+    The point is the thing every team loses: "where is everyone else's CAD?"
+    A senior's SLDASM lives on their laptop and vanishes at graduation. Here a
+    file is published once, tagged by subsystem and uploader, and everyone can
+    browse/filter/download it from the shared project store — so next year finds
+    the geometry, not a dead Google-Drive link.
+
+    Storage: small files are embedded as base64 in `data_b64` (kept under a size
+    cap so the whole project document stays sane); large assemblies are shared
+    as a `link` instead. Exactly one of the two is expected to be set.
+    """
+    name: str                       # original filename, e.g. "front_upright.SLDPRT"
+    subsystem: str = "general"      # tag: suspension, chassis, aero, ev, SES, ...
+    uploader: str = ""              # who published it
+    kind: str = "file"              # "file" (embedded) | "link" (external URL)
+    data_b64: str = ""              # base64 payload when kind == "file"
+    link: str = ""                  # URL when kind == "link"
+    size_bytes: int = 0
+    note: str = ""
+    ts: str = ""
+    id: str = ""
+
+    def __post_init__(self):
+        if not self.ts:
+            self.ts = _dt.datetime.now().isoformat(timespec="seconds")
+        if not self.id:
+            self.id = _dt.datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+    @property
+    def ext(self) -> str:
+        return os.path.splitext(self.name)[1].lower().lstrip(".")
 
 
 # --------------------------------------------------------------------------- #
@@ -117,9 +172,50 @@ class JSONFileBackend:
                 return json.load(f)
         return {}
 
-    def write(self, payload: dict):
+    def read_version(self):
+        """Cheap change-probe for polling: the file's mtime as a string, without
+        parsing the JSON. Lets a poll skip the full read when nothing changed.
+        Returns None if the file doesn't exist yet. Never raises."""
+        try:
+            return str(os.path.getmtime(self.path))
+        except OSError:
+            return None
+
+    def write(self, payload: dict, expected_version=None):
+        # expected_version is accepted for interface parity with the Supabase
+        # backends but not enforced here: this backend is the single-user local
+        # file (laptop/tests), where the store in memory is the only editor.
         with open(self.path, "w") as f:
             json.dump(payload, f, indent=2)
+
+
+# Process-global cache for the full project blob, shared across every browser
+# session on this Streamlit server. Maps project_id -> ((project_id, version),
+# blob). Keyed on the `updated` version so a change by any editor invalidates it
+# for everyone: read() compares the current version (from the cheap probe) to the
+# cached key and only re-transfers the full document when they differ. This is
+# what stops the ~MB blob being re-pulled from Supabase on every rerun. Not
+# @st.cache_data because this module must stay importable in plain scripts/tests
+# with no Streamlit runtime; a plain dict gives the same hit/miss behaviour
+# without a hard Streamlit dependency.
+_project_blob_cache: dict = {}
+
+
+class StaleWriteError(RuntimeError):
+    """Raised when a save would overwrite a version of the project that someone
+    else wrote after we loaded ours (optimistic-concurrency conflict).
+
+    Carries what we loaded (`mine`) and what the server holds now (`theirs`) so
+    the UI can say exactly what happened and offer a reload instead of silently
+    letting last-write-wins destroy a teammate's ledger edits."""
+
+    def __init__(self, mine, theirs):
+        self.mine = mine
+        self.theirs = theirs
+        super().__init__(
+            f"project changed on the server since it was loaded "
+            f"(loaded version {mine!r}, server now holds {theirs!r}); "
+            f"reload before saving so the newer edits aren't overwritten")
 
 
 class SupabaseBackend:
@@ -144,14 +240,118 @@ class SupabaseBackend:
         self.project_id = project_id
 
     def read(self) -> dict:
+        """Return the whole project blob, using a version-keyed cache so the full
+        ~MB document is only transferred over the network when it has actually
+        changed.
+
+        Egress note: this document was previously re-fetched in full on every
+        Streamlit rerun (each rerun re-runs the script top-to-bottom, and the
+        project load sits near the top). On a free-tier plan that repeated
+        full-blob transfer is the dominant egress cost. Here we first do the
+        cheap scalar version probe (`read_version()`, which transfers only the
+        `updated` timestamp), and only pull the full `data` column when the
+        version has moved since we last cached it. When nothing changed — the
+        common case, since most reruns are a user nudging a slider, not another
+        editor saving — we serve the cached blob and transfer only the tiny
+        timestamp. Multi-editor correctness is preserved: a write bumps
+        `updated`, which changes the cache key, so the next read re-fetches once.
+
+        The cache is process-global (module-level `_project_blob_cache`), so it's
+        shared across every browser session on the same Streamlit server, not
+        per-session — one editor's save invalidates it for everyone."""
+        version = self.read_version()
+        cache_key = (self.project_id, version)
+
+        # Cache hit: same project + same version we already hold. version is None
+        # only when the probe failed or the row is missing — in that case skip the
+        # cache and fall through to an authoritative full read rather than trust a
+        # possibly-stale entry.
+        if version is not None:
+            cached = _project_blob_cache.get(self.project_id)
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
+
+        # Cache miss (first load, or the version moved): pull the full blob once.
         resp = (self.client.table(self.TABLE)
                 .select("data").eq("id", self.project_id).execute())
         rows = resp.data or []
-        return rows[0]["data"] if rows else {}
+        blob = rows[0]["data"] if rows else {}
 
-    def write(self, payload: dict):
-        self.client.table(self.TABLE).upsert(
-            {"id": self.project_id, "data": payload}).execute()
+        # Only cache when we have a real version to key on. With version None we
+        # can't safely detect the next change, so we don't cache — every such read
+        # stays a full authoritative read.
+        if version is not None:
+            _project_blob_cache[self.project_id] = (cache_key, blob)
+        return blob
+
+    def read_version(self):
+        """Cheap change-probe for polling: pull ONLY the `updated` timestamp out
+        of the JSON row instead of the whole project blob. On Postgres this is a
+        tiny scalar select (`data->>'updated'`) rather than transferring the full
+        document every poll. Returns None on any error so the caller falls back to
+        a full read rather than assuming 'no change'."""
+        try:
+            resp = (self.client.table(self.TABLE)
+                    .select("data->>updated")
+                    .eq("id", self.project_id).execute())
+            rows = resp.data or []
+            if not rows:
+                return None
+            row = rows[0]
+            return row.get("updated") or next(iter(row.values()), None)
+        except Exception:
+            return None
+
+    def write(self, payload: dict, expected_version=None):
+        """Persist the blob with optimistic concurrency.
+
+        expected_version is the `updated` stamp of the blob we LOADED. If the
+        row's current stamp differs, someone else saved since we read — raise
+        StaleWriteError instead of overwriting their work (the old behaviour
+        was unconditional last-write-wins, which silently destroys a
+        teammate's edits the moment two people have the app open).
+
+        expected_version=None means "no baseline": first save of a fresh
+        project, or a caller that hasn't adopted versioning. If the row does
+        not exist we insert; if it exists WITH a version we refuse (someone
+        created it while we held an empty project); if it exists without a
+        version (a pre-locking legacy blob) we allow the write once, which is
+        the upgrade path.
+        """
+        row = {"id": self.project_id, "data": payload}
+        if expected_version is not None:
+            # Atomic CAS: UPDATE ... WHERE id = ? AND data->>'updated' = ?.
+            # PostgREST returns the updated rows; zero rows = the version moved
+            # (or the row vanished) — distinguish and refuse.
+            resp = (self.client.table(self.TABLE)
+                    .update(row)
+                    .eq("id", self.project_id)
+                    .eq("data->>updated", str(expected_version))
+                    .execute())
+            if not (resp.data or []):
+                theirs = self.read_version()
+                raise StaleWriteError(mine=expected_version, theirs=theirs)
+        else:
+            current = self.read_version()
+            if current is not None:
+                # A versioned row exists but we loaded nothing — refuse rather
+                # than wipe it. (Legacy unversioned rows return None here and
+                # fall through to the upsert, which is the one-time migration.)
+                raise StaleWriteError(mine=None, theirs=current)
+            self.client.table(self.TABLE).upsert(row).execute()
+        # Refresh the process-global cache with what we just wrote, keyed on the
+        # payload's own `updated` stamp, so the very next read() on THIS server
+        # serves the new blob from memory. Other servers/sessions pick the change
+        # up via their own version probe.
+        try:
+            new_version = payload.get("updated")
+            if new_version is not None:
+                _project_blob_cache[self.project_id] = (
+                    (self.project_id, new_version), payload)
+            else:
+                _project_blob_cache.pop(self.project_id, None)
+        except Exception:
+            _project_blob_cache.pop(self.project_id, None)
 
 
 def _read_credential(name: str):
@@ -222,10 +422,12 @@ class ProjectStore:
     # Class-level defaults: guarantee these attributes resolve even if __init__
     # is interrupted partway (a lazy optional-import failure, an exception in
     # load(), or a half-built instance returned from a cache). The render path
-    # reads store.geometry / store.board unconditionally, so a missing attribute
-    # turns into a redacted AttributeError on the deployed app.
+    # reads store.geometry / store.board / store.cad_files unconditionally, so a
+    # missing attribute turns into a redacted AttributeError on the deployed app.
     geometry = None
     board = None
+    cad_files: list = []
+    ledger: dict = {}
 
     def __init__(self, path: str = DEFAULT_PROJECT, backend=None):
         self.path = path
@@ -235,6 +437,11 @@ class ProjectStore:
         self.weights: list[WeightItem] = []
         self.decisions: list[Decision] = []
         self.notes: list[Note] = []
+        self.cad_files: list[CADFile] = []
+        # Integration ledger (cross-team declarations) — persisted as the raw
+        # dict the app keeps in session_state, so this module stays numpy-free
+        # and the blob is exactly what the tabs read/write.
+        self.ledger: dict = {}
         # Geometric mount-point / keep-out ledger (lazy import to avoid a hard
         # numpy dependency for callers that only touch weights/decisions/notes).
         # Defensive: never let an optional import failure leave the store without
@@ -266,6 +473,12 @@ class ProjectStore:
             self.harness = None
         self.load_error = None
         self.save_error = None
+        self.save_conflict = None       # set when a save loses an optimistic-lock race
+        self._loaded_version = None     # `updated` stamp of the blob our edits sit on
+        # EV electrical database: pack + motor params extracted from the
+        # electrics lead's Excel workbook. Persisted here so teams don't
+        # have to re-upload the xlsx every session — configure once, use always.
+        self.ev_excel_params: dict = {}
         # Pick a backend: explicit > auto-detected Supabase > local JSON file.
         self.backend = backend or _auto_backend(path)
         self.load()
@@ -278,9 +491,12 @@ class ProjectStore:
             "weights": [asdict(w) for w in self.weights],
             "decisions": [asdict(x) for x in self.decisions],
             "notes": [asdict(n) for n in self.notes],
+            "cad_files": [asdict(c) for c in self.cad_files],
             "geometry": self.geometry.as_dict() if self.geometry else {},
             "board": self.board.as_dict() if self.board else {},
             "harness": self.harness.as_dict() if getattr(self, "harness", None) else {},
+            "ev_excel_params": getattr(self, "ev_excel_params", {}),
+            "ledger": getattr(self, "ledger", {}) or {},
             "updated": _dt.datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -293,6 +509,7 @@ class ProjectStore:
         self.weights = [WeightItem(**w) for w in d.get("weights", [])]
         self.decisions = [Decision(**x) for x in d.get("decisions", [])]
         self.notes = [Note(**n) for n in d.get("notes", [])]
+        self.cad_files = [CADFile(**c) for c in d.get("cad_files", [])]
         geom = d.get("geometry")
         if geom:
             from .mountpoints import GeometryLedger
@@ -305,6 +522,12 @@ class ProjectStore:
         if harness:
             from .harness import HarnessLedger
             self.harness = HarnessLedger.from_dict(harness)
+        ev_p = d.get("ev_excel_params")
+        if ev_p and isinstance(ev_p, dict):
+            self.ev_excel_params = ev_p
+        led = d.get("ledger")
+        if isinstance(led, dict) and led:
+            self.ledger = led
 
     # ----------------------------- io ---------------------------------- #
     def load(self):
@@ -317,19 +540,68 @@ class ProjectStore:
             self.load_error = f"Could not read saved project data: {e}"
             return
         self._apply(d)
+        # Optimistic-concurrency baseline: remember which version of the blob
+        # this store's edits are based on. save() sends it as expected_version
+        # so a concurrent teammate's save can never be silently overwritten.
+        self._loaded_version = (d or {}).get("updated")
+
+    def reload_latest(self):
+        """Discard this store's baseline and re-read the server's current blob.
+        The recovery path after a StaleWriteError: the user re-applies their
+        edit on top of the teammate's version instead of overwriting it."""
+        self.save_conflict = None
+        self.load()
 
     def save(self):
         """Persist the project. Fail-safe: a storage backend error (e.g. a remote
         Supabase/Postgres misconfiguration) is recorded on `self.save_error` and
         returns False rather than raising, so a save side-effect can never crash the
-        caller. Returns True on success."""
+        caller. Returns True on success.
+
+        Concurrency: the write carries the version this store loaded
+        (expected_version). If a teammate saved in between, the backend raises
+        StaleWriteError; we record it on `self.save_conflict` (and mirror it to
+        `save_error` for older call sites) and return False — the caller shows
+        the conflict and offers reload_latest(). No silent last-write-wins."""
+        payload = self._payload()
         try:
-            self.backend.write(self._payload())
+            try:
+                self.backend.write(
+                    payload, expected_version=getattr(self, "_loaded_version", None))
+            except TypeError:
+                # Backend predates the expected_version contract (external /
+                # test doubles) — fall back to the unconditional write.
+                self.backend.write(payload)
             self.save_error = None
+            self.save_conflict = None
+            # Our write is now the server version; future saves compare to it.
+            self._loaded_version = payload.get("updated")
             return True
+        except StaleWriteError as e:
+            self.save_conflict = str(e)
+            self.save_error = (
+                "Not saved — a teammate saved a newer version of the project "
+                "while you were editing. Reload the latest project, then "
+                "re-apply your change so theirs isn't overwritten.")
+            return False
         except Exception as e:
             self.save_error = f"Could not write project data: {e}"
             return False
+
+    def read_version(self):
+        """Cheap 'has anything changed?' probe for the notification poller.
+
+        Delegates to the backend's lightweight version read (file mtime for the
+        JSON backend, a scalar `updated` select for Supabase). If the backend
+        doesn't implement one, returns None, which callers treat as 'unknown —
+        do a full read to be safe'. Never raises."""
+        rv = getattr(self.backend, "read_version", None)
+        if callable(rv):
+            try:
+                return rv()
+            except Exception:
+                return None
+        return None
 
     def as_json(self) -> str:
         return json.dumps({
@@ -338,6 +610,7 @@ class ProjectStore:
             "weights": [asdict(w) for w in self.weights],
             "decisions": [asdict(x) for x in self.decisions],
             "notes": [asdict(n) for n in self.notes],
+            "cad_files": [asdict(c) for c in self.cad_files],
             "geometry": self.geometry.as_dict() if getattr(self, "geometry", None) else {},
             "board": self.board.as_dict() if getattr(self, "board", None) else {},
             "harness": self.harness.as_dict() if getattr(self, "harness", None) else {},
@@ -395,6 +668,34 @@ class ProjectStore:
     def add_note(self, note: Note):
         self.notes.append(note)
 
+    # ----------------------- CAD library ------------------------------- #
+    def add_cad_file(self, cad: CADFile):
+        """Publish a file to the shared Team CAD library."""
+        self.cad_files.append(cad)
+
+    def remove_cad_file(self, file_id: str) -> bool:
+        """Remove a library entry by id. Returns True if one was removed."""
+        n0 = len(self.cad_files)
+        self.cad_files = [c for c in self.cad_files if c.id != file_id]
+        return len(self.cad_files) != n0
+
+    def cad_files_for(self, subsystem: str | None = None) -> list[CADFile]:
+        """Library entries, newest-first, optionally filtered by subsystem tag
+        (case-insensitive). subsystem=None returns everything. Defensive: tolerate
+        a store whose cad_files was never initialised (interrupted __init__, old
+        cached instance) so the render path can't crash with an AttributeError."""
+        out = getattr(self, "cad_files", None) or []
+        if subsystem:
+            s = subsystem.strip().lower()
+            out = [c for c in out if (c.subsystem or "").lower() == s]
+        return sorted(out, key=lambda c: c.ts, reverse=True)
+
+    def cad_subsystems(self) -> list[str]:
+        """Unique, sorted subsystem tags present in the library."""
+        return sorted({(c.subsystem or "general").strip()
+                       for c in (getattr(self, "cad_files", None) or [])
+                       if (c.subsystem or "").strip()})
+
     def resolve_note(self, note_id: str):
         for n in self.notes:
             if n.id == note_id:
@@ -404,6 +705,26 @@ class ProjectStore:
         for n in self.notes:
             if n.id == note_id:
                 n.status = "open"
+
+    def mark_note_seen(self, viewer: str, exclude_author: bool = True) -> bool:
+        """Record that `viewer` has now seen the notes addressed to them.
+
+        Stamps every note this viewer can see (i.e. not ones they authored, when
+        exclude_author is set) with a first-seen timestamp. Returns True if any
+        note was newly stamped, so the caller knows whether a save is worthwhile.
+        A viewer is a stable label — the lead's typed name, or a session id when
+        they haven't given one.
+        """
+        if not viewer:
+            return False
+        changed = False
+        for n in self.notes:
+            if exclude_author and n.author and n.author == viewer:
+                continue
+            if viewer not in n.seen_by:
+                n.seen_by[viewer] = _dt.datetime.now().isoformat(timespec="seconds")
+                changed = True
+        return changed
 
     def notes_for(self, team: str, include_all=True):
         """Notes addressed to a team (and 'all' broadcasts), newest first."""
@@ -559,11 +880,14 @@ def estimate_mass_g(volume_mm3: float, material: str) -> float | None:
 # --------------------------------------------------------------------------- #
 def build_handover_markdown(store: ProjectStore,
                             geometry: dict | None = None,
-                            extra_notes: str = "") -> str:
+                            extra_notes: str = "",
+                            frame_tag: str = "") -> str:
     """
     Assemble the full handover report as Markdown. `geometry` is an optional dict
     of the current suspension setup (static alignment, key metrics) so the report
-    captures the design state, not just the admin data.
+    captures the design state, not just the admin data. `frame_tag` is the team's
+    declared coordinate convention (from Frames & Datums) — stamped up front so
+    every dimension in this document is unambiguous to next year's cohort.
     """
     b = store.budget_status()
     today = _dt.date.today().isoformat()
@@ -573,6 +897,14 @@ def build_handover_markdown(store: ProjectStore,
     L.append("This report is auto-generated from the KinematiK project file. It "
              "captures the car's design state, weight budget, and the reasoning behind "
              "key decisions so next year's team starts from knowledge, not a blank page.\n")
+
+    # Coordinate convention — first, because every number below assumes it.
+    if frame_tag:
+        L.append("## Coordinate convention\n")
+        L.append(f"> {frame_tag}\n")
+        L.append("_All dimensions in this report and in the linked CAD exports "
+                 "follow this frame unless a row explicitly states otherwise. "
+                 "Declared and maintained in KinematiK → 🧭 Frames & Datums._\n")
 
     # Weight budget
     L.append("## Weight budget\n")
